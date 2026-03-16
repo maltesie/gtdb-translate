@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "gtdb-translate"
+version = "0.1.0"
+description = "Translate taxonomy names across GTDB releases and from NCBI to GTDB."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "networkx>=2.6",
+    "msgpack>=1.0",
+    "zstandard>=0.18",
+    "pandas>=1.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+gtdb-translate = "gtdb_translate.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/maltesie/gtdb-translate"
+Repository = "https://github.com/maltesie/gtdb-translate"
+Issues = "https://github.com/maltesie/gtdb-translate/issues"
