@@ -26,3 +26,6 @@ gtdb-translate = "gtdb_translate.cli:main"
 Homepage = "https://github.com/maltesie/gtdb-translate"
 Repository = "https://github.com/maltesie/gtdb-translate"
 Issues = "https://github.com/maltesie/gtdb-translate/issues"
+
+[tool.setuptools.packages.find]
+include = ["gtdb_translate*"]
