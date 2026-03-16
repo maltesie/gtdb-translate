@@ -42,7 +42,9 @@ def _translate(args: argparse.Namespace) -> None:
     if args.bundle:
         translator = NCBITranslator.load(args.bundle)
     else:
-        translator = NCBITranslator.default(version=args.version)
+        translator = NCBITranslator.default(
+            version=args.version, force_download=args.force
+        )
 
     # Load input table
     sep_in = "," if args.in_file.endswith(".csv") else "\t"
@@ -194,6 +196,11 @@ def main(argv: list[str] | None = None) -> None:
         "--version",
         default=None,
         help="GTDB version to download (default: latest release)",
+    )
+    p_trans.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download the bundle even if cached locally",
     )
 
     args = parser.parse_args(argv)

@@ -11,8 +11,8 @@ from typing import Optional, Union
 logger = logging.getLogger(__name__)
 
 GITHUB_REPO = "maltesie/gtdb-translate"
-GITHUB_API_LATEST = (
-    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_API_RELEASES = (
+    f"https://api.github.com/repos/{GITHUB_REPO}/releases"
 )
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "gtdb_translate"
@@ -20,36 +20,49 @@ BUNDLE_FILENAME_TEMPLATE = "gtdb_translate_{version}.msgpack.zst"
 
 
 def _resolve_latest_version() -> str:
-    """Query the GitHub API for the latest release tag name.
+    """Query the GitHub API for the latest release that has a bundle asset.
+
+    Iterates through releases (newest first) and returns the tag of the
+    first one whose assets include a file matching
+    ``gtdb_translate_<tag>.msgpack.zst``.
 
     Returns
     -------
     str
-        The tag name of the latest release (e.g. ``"r226"``).
+        The tag name of the latest bundle release (e.g. ``"r226"``).
 
     Raises
     ------
     RuntimeError
-        If the API request fails or returns unexpected data.
+        If the API request fails or no release with a bundle is found.
     """
     req = urllib.request.Request(
-        GITHUB_API_LATEST,
+        GITHUB_API_RELEASES,
         headers={"Accept": "application/vnd.github.v3+json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        tag = data.get("tag_name")
-        if not tag:
-            raise ValueError("No tag_name in response")
-        logger.info("Latest release: %s", tag)
-        return tag
+            releases = json.loads(resp.read().decode())
     except Exception as exc:
         raise RuntimeError(
-            f"Failed to resolve latest release from {GITHUB_API_LATEST}. "
+            f"Failed to query releases from {GITHUB_API_RELEASES}. "
             f"You can specify a version explicitly instead.\n\n"
             f"Original error: {exc}"
         ) from exc
+
+    for release in releases:
+        tag = release.get("tag_name", "")
+        expected_asset = BUNDLE_FILENAME_TEMPLATE.format(version=tag)
+        asset_names = [a.get("name", "") for a in release.get("assets", [])]
+        if expected_asset in asset_names:
+            logger.info("Latest bundle release: %s", tag)
+            return tag
+
+    raise RuntimeError(
+        f"No release with a translation bundle found in "
+        f"https://github.com/{GITHUB_REPO}/releases. "
+        f"You can specify a version explicitly instead."
+    )
 
 
 def _asset_download_url(version: str) -> str:
