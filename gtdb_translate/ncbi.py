@@ -264,7 +264,8 @@ class NCBITranslator:
             Translated entries.  ``"no_translation"`` when no mapping
             was found.
         """
-        translations = ["no_translation"] * len(entries)
+        NO_TRANS = "no_translation"
+        translations = [NO_TRANS] * len(entries)
         for i, entry in enumerate(entries):
             if not isinstance(entry, str):
                 continue
@@ -273,29 +274,33 @@ class NCBITranslator:
                 taxa[-1].endswith("Bacteria") or taxa[-1].endswith("Archaea")
             ):
                 continue
-            for ii, tax in enumerate(taxa):
-                gtdb_name = self._lookup_name(tax)
-                if full_lineage:
-                    best = "no_gtdb"
+            if full_lineage:
+                for ii, tax in enumerate(taxa):
+                    gtdb_name = self._lookup_name(tax)
                     if gtdb_name in self.gtdb_name_to_lineage:
                         best = self.gtdb_name_to_lineage[gtdb_name]
-                    if best != "no_gtdb":
                         if best.count(";") >= len(taxa) - ii:
                             best = ";".join(
                                 best.split(";")[: len(taxa) - ii]
                             )
                         translations[i] = best
                         break
-                else:
-                    translation = (
-                        gtdb_name[3:]
-                        if (gtdb_name is not None and gtdb_name != "none")
-                        else ""
-                    )
-                    if translations[i] == "no_translation":
-                        translations[i] = translation
+            else:
+                parts = []
+                for tax in taxa:
+                    gtdb_name = self._lookup_name(tax)
+                    if gtdb_name is not None and gtdb_name != "none":
+                        parts.append(gtdb_name[3:])
                     else:
-                        translations[i] = translation + sep + translations[i]
+                        parts.append(NO_TRANS)
+                # Reverse back to original order
+                parts = parts[::-1]
+                # If every part failed, single "no_translation";
+                # otherwise join (keeping per-part "no_translation" markers)
+                if all(p == NO_TRANS for p in parts):
+                    translations[i] = NO_TRANS
+                else:
+                    translations[i] = sep.join(parts)
         return translations
 
     def translate_ids(
@@ -319,32 +324,77 @@ class NCBITranslator:
         -------
         list of str
         """
-        translations = ["no_translation"] * len(entries)
+        NO_TRANS = "no_translation"
+        translations = [NO_TRANS] * len(entries)
         for i, taxs in enumerate(entries):
             if not isinstance(taxs, str):
                 continue
             parts = []
             for taxid in taxs.split(sep):
-                sci = self.ncbi_id_to_scientific.get(taxid)
+                sci = self.ncbi_id_to_scientific.get(taxid.strip())
                 if sci is None:
+                    parts.append(NO_TRANS)
                     continue
                 gtdb_name = self.ncbi_name_to_gtdb.get(sci, "none")
+                if gtdb_name == "none":
+                    parts.append(NO_TRANS)
+                    continue
                 if full_lineage and gtdb_name in self.gtdb_name_to_lineage:
                     gtdb_name = self.gtdb_name_to_lineage[gtdb_name]
-                if gtdb_name == "none":
-                    gtdb_name = ""
                 parts.append(gtdb_name)
-            translations[i] = sep.join(parts)
+            if all(p == NO_TRANS for p in parts):
+                translations[i] = NO_TRANS
+            else:
+                translations[i] = sep.join(parts)
         return translations
 
     def _lookup_name(self, name: str) -> Optional[str]:
-        """Look up a single NCBI name, trying bracket-removal as fallback."""
+        """Look up a single NCBI name with progressive fallbacks.
+
+        Tries, in order:
+
+        1. Exact match
+        2. Bracket removal  (``[Clostridium]`` → ``Clostridium``)
+        3. Parenthetical removal  (``Klebsiella pneumoniae (resistant)``
+           → ``Klebsiella pneumoniae``)
+        4. Binomial (first two words)  — strips strain IDs like
+           ``Acinetobacter baumannii AB03``
+           → ``Acinetobacter baumannii``
+        5. Genus only  (``Bombilactobacillus sp.``
+           → ``Bombilactobacillus``)
+        """
+        # 1. Exact
         if name in self.ncbi_name_to_gtdb:
             return self.ncbi_name_to_gtdb[name]
+
+        # 2. Bracket removal
         if "[" in name:
             cleaned = name.replace("[", "").replace("]", "")
             if cleaned in self.ncbi_name_to_gtdb:
                 return self.ncbi_name_to_gtdb[cleaned]
+            # Continue with cleaned version for further fallbacks
+            name = cleaned
+
+        # 3. Parenthetical removal
+        if "(" in name:
+            stripped = name.split("(")[0].strip()
+            if stripped in self.ncbi_name_to_gtdb:
+                return self.ncbi_name_to_gtdb[stripped]
+            name = stripped
+
+        # 4. Binomial (first two words) — catches strain suffixes
+        words = name.split()
+        if len(words) > 2:
+            binomial = f"{words[0]} {words[1]}"
+            if binomial in self.ncbi_name_to_gtdb:
+                return self.ncbi_name_to_gtdb[binomial]
+
+        # 5. Genus only — catches "Genus sp." and bare genus names
+        if len(words) >= 1:
+            genus = words[0]
+            if genus in self.ncbi_name_to_gtdb:
+                return self.ncbi_name_to_gtdb[genus]
+
         return None
 
     # ------------------------------------------------------------------
