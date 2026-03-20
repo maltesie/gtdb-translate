@@ -393,6 +393,8 @@ class NCBITranslator:
 
         Tries, in order:
 
+        0. Strip bare ``sp.``/``sp``/``spp.``/``spp`` suffix
+           (``Pseudomonas sp.`` → ``Pseudomonas``)
         1. Exact match
         2. Bracket removal  (``[Clostridium]`` → ``Clostridium``)
         3. Parenthetical removal  (``Klebsiella pneumoniae (resistant)``
@@ -410,25 +412,18 @@ class NCBITranslator:
 
         At each step, ``"none"`` values in the dictionary are treated as
         misses so that the fallback chain continues.
-
-        If the input matches a ``"Genus sp."`` / ``"Genus spp."`` pattern,
-        species-level results (``s__...``) are rejected so that the lookup
-        naturally falls through to a genus-level result.
         """
         import re
 
-        _SP_PATTERN = re.compile(r"^(\S+)\s+spp?\.?$")
-        is_sp_input = bool(_SP_PATTERN.match(name.strip()))
-
         def _get(key: str) -> Optional[str]:
-            """Return dict value if it exists and isn't 'none'.
-            Rejects species-level results for sp. inputs."""
+            """Return dict value if it exists and isn't 'none'."""
             val = self.ncbi_name_to_gtdb.get(key)
             if val is not None and val != "none":
-                if is_sp_input and val.startswith("s__"):
-                    return None
                 return val
             return None
+
+        # 0. Strip bare "sp."/"spp." suffix → treat as genus
+        name = re.sub(r"\s+spp?\.?$", "", name.strip())
 
         # 1. Exact
         result = _get(name)
@@ -444,9 +439,10 @@ class NCBITranslator:
             # Continue with cleaned version for further fallbacks
             name = cleaned
 
-        # 3. Parenthetical removal
+        # 3. Parenthetical removal — remove (...) content, keep the rest
         if "(" in name:
-            stripped = name.split("(")[0].strip()
+            stripped = re.sub(r"\([^)]*\)", "", name).strip()
+            stripped = re.sub(r"\s+", " ", stripped)  # collapse whitespace
             result = _get(stripped)
             if result is not None:
                 return result
