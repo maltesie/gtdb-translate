@@ -2,8 +2,9 @@
 
 Subcommands
 -----------
-build     Build a translation bundle from raw GTDB + NCBI files.
-translate Batch-translate a column in a CSV/TSV file.
+build    Build a translation bundle from raw GTDB + NCBI files.
+ncbi     Batch-translate NCBI/SILVA names or tax IDs to GTDB.
+forward  Forward-translate old GTDB names to the current release.
 """
 
 from __future__ import annotations
@@ -30,25 +31,37 @@ def _build(args: argparse.Namespace) -> None:
     print(f"  NCBI ID → scientific: {len(translator.ncbi_id_to_scientific):,}")
     print(f"  GTDB lineage entries: {len(translator.gtdb_name_to_lineage):,}")
     if translator.forward:
-        print(f"  Forward translations: {len(translator.forward):,}")
+        print(f"  Forward translations: {translator.forward}")
 
 
-def _translate(args: argparse.Namespace) -> None:
+def _load_translator(args: argparse.Namespace):
+    """Load an NCBITranslator from bundle or auto-download."""
+    from .ncbi import NCBITranslator
+
+    if args.bundle:
+        return NCBITranslator.load(args.bundle)
+    return NCBITranslator.default(
+        version=args.version, force_download=args.force
+    )
+
+
+def _read_table(path: str):
+    """Read a CSV or TSV into a DataFrame."""
+    import pandas as pd
+
+    sep_in = "," if path.endswith(".csv") else "\t"
+    return pd.read_csv(path, dtype=str, sep=sep_in)
+
+
+# -- ncbi subcommand (was: translate) -------------------------------------
+
+def _ncbi(args: argparse.Namespace) -> None:
     import pandas as pd
 
     from .ncbi import NCBITranslator
 
-    # Load translator
-    if args.bundle:
-        translator = NCBITranslator.load(args.bundle)
-    else:
-        translator = NCBITranslator.default(
-            version=args.version, force_download=args.force
-        )
-
-    # Load input table
-    sep_in = "," if args.in_file.endswith(".csv") else "\t"
-    df = pd.read_csv(args.in_file, dtype=str, sep=sep_in)
+    translator = _load_translator(args)
+    df = _read_table(args.in_file)
 
     # Detect or validate column
     column_name = args.column_name
@@ -65,8 +78,8 @@ def _translate(args: argparse.Namespace) -> None:
 
     column = df[column_name]
 
-    # Sanitize if full-lineage mode
-    if args.full_lineage and not args.from_taxids:
+    # Sanitize SILVA lineages (opt-in)
+    if args.from_silva and not args.from_taxids:
         column = NCBITranslator.sanitize_lineages(
             column,
             lineage_sep=args.lineage_sep,
@@ -82,7 +95,8 @@ def _translate(args: argparse.Namespace) -> None:
         )
     else:
         df[args.out_column_name] = translator.translate(
-            column, sep=args.lineage_sep, full_lineage=args.full_lineage
+            column, sep=args.lineage_sep, full_lineage=args.full_lineage,
+            genus_fallback=args.genus_fallback,
         )
 
     # Optional extras
@@ -92,13 +106,148 @@ def _translate(args: argparse.Namespace) -> None:
         ]
 
     if args.output_full_lineage:
-        df[column_name + "_lineage"] = [
-            translator.gtdb_name_to_lineage.get("s__" + t, "") if t else ""
-            for t in df[args.out_column_name]
+        def lookup_lineage(name):
+            if not name:
+                return ""
+            for prefix in ("s__", "g__", "f__", "o__", "c__", "p__", "d__"):
+                result = translator.gtdb_name_to_lineage.get(prefix + name)
+                if result:
+                    return result
+            return ""
+
+        df[args.out_column_name + "_lineage"] = [
+            lookup_lineage(t) for t in df[args.out_column_name]
         ]
+
+    if args.empty_on_fail:
+        df[args.out_column_name] = df[args.out_column_name].replace("no_translation", "")
 
     df.to_csv(args.out_file, index=False)
     print(f"Output written to {args.out_file}")
+
+def _forward(args: argparse.Namespace) -> None:
+    import pandas as pd
+
+    translator = _load_translator(args)
+
+    if translator.forward is None:
+        print(
+            "ERROR: The loaded bundle does not contain a forward "
+            "translator. Rebuild the bundle with --changelog.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    df = _read_table(args.in_file)
+    column_name = args.column_name
+
+    if column_name not in df.columns:
+        print(
+            f"ERROR: Column '{column_name}' not found in {args.in_file}. "
+            f"Available: {', '.join(df.columns)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    NO_TRANS = "no_translation"
+    fwd = translator.forward
+    lineage_dict = translator.gtdb_name_to_lineage
+
+    # Prefixes to try, from most specific to least
+    RANK_PREFIXES = [
+        ("s__", "species"),
+        ("g__", "genus"),
+        ("f__", "family"),
+        ("o__", "order"),
+        ("c__", "class"),
+        ("p__", "phylum"),
+        ("d__", "domain"),
+    ]
+
+    def forward_one(name: str) -> str:
+        """Forward-translate a single GTDB name.
+
+        1. Check if it's already in the current GTDB (try all rank prefixes)
+        2. If not, forward-map it, then check again
+        3. Return the current name or 'no_translation'
+        """
+        if not isinstance(name, str) or not name.strip():
+            return NO_TRANS
+
+        name = name.strip()
+
+        # 1. Already in current GTDB?
+        for prefix, rank in RANK_PREFIXES:
+            if (prefix + name) in lineage_dict:
+                return name
+
+        # 2. Try forward mapping
+        # Species-level (contains a space)
+        if " " in name:
+            mapped = fwd.translate(name)
+            if mapped != name and ("s__" + mapped) in lineage_dict:
+                return mapped
+        # Try all rank dicts
+        for prefix, rank in RANK_PREFIXES[1:]:  # skip species
+            mapped = fwd.translate_rank(name, rank)
+            if mapped != name and (prefix + mapped) in lineage_dict:
+                return mapped
+
+        return NO_TRANS
+
+    df[args.out_column_name] = [forward_one(v) for v in df[column_name]]
+
+    # Count results
+    n_total = len(df)
+    n_translated = (df[args.out_column_name] != NO_TRANS).sum()
+    n_unchanged = (df[args.out_column_name] == df[column_name]).sum()
+    n_mapped = n_translated - n_unchanged
+    print(f"Forward mapping: {n_total} entries")
+    print(f"  Already current: {n_unchanged}")
+    print(f"  Forward-mapped:  {n_mapped}")
+    print(f"  No translation:  {n_total - n_translated}")
+
+    # Optional lineage column
+    if args.output_full_lineage:
+        def get_lineage(name):
+            if name == NO_TRANS:
+                return ""
+            for prefix, _ in RANK_PREFIXES:
+                result = lineage_dict.get(prefix + name)
+                if result:
+                    return result
+            return ""
+
+        df[args.out_column_name + "_lineage"] = [
+            get_lineage(t) for t in df[args.out_column_name]
+        ]
+
+    if args.empty_on_fail:
+        df[args.out_column_name] = df[args.out_column_name].replace("no_translation", "")
+
+    df.to_csv(args.out_file, index=False)
+    print(f"Output written to {args.out_file}")
+
+
+# -- CLI entry point -------------------------------------------------------
+
+def _add_bundle_args(parser: argparse.ArgumentParser) -> None:
+    """Add --bundle, --version, --force to a subparser."""
+    parser.add_argument(
+        "--bundle",
+        default=None,
+        help="Path to a local .msgpack.zst bundle (downloads latest if omitted)",
+    )
+    parser.add_argument(
+        "--version",
+        default=None,
+        help="GTDB version to download (default: latest release)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download the bundle even if cached locally",
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -145,63 +294,94 @@ def main(argv: list[str] | None = None) -> None:
         help="Output bundle path (default: gtdb_translate_<version>.msgpack.zst)",
     )
 
-    # -- translate -----------------------------------------------------
-    p_trans = subparsers.add_parser(
-        "translate",
-        help="Batch-translate a column in a CSV/TSV file.",
+    # -- ncbi ----------------------------------------------------------
+    p_ncbi = subparsers.add_parser(
+        "ncbi",
+        help="Batch-translate NCBI/SILVA names or tax IDs to GTDB.",
     )
-    p_trans.add_argument("--in_file", required=True, help="Input CSV or TSV")
-    p_trans.add_argument("--out_file", required=True, help="Output CSV")
-    p_trans.add_argument(
+    p_ncbi.add_argument("--in_file", required=True, help="Input CSV or TSV")
+    p_ncbi.add_argument("--out_file", required=True, help="Output CSV")
+    p_ncbi.add_argument(
         "--column_name",
         default=None,
         help="Column to translate (auto-detected if omitted)",
     )
-    p_trans.add_argument(
+    p_ncbi.add_argument(
         "--out_column_name",
         default="gtdb_translated",
         help="Name for the translated column (default: gtdb_translated)",
     )
-    p_trans.add_argument(
+    p_ncbi.add_argument(
         "--sep",
         default="|",
         help="Separator for multiple names per cell (default: |)",
     )
-    p_trans.add_argument(
+    p_ncbi.add_argument(
         "--lineage_sep",
         default=";",
         help="Separator within a lineage string (default: ;)",
     )
-    p_trans.add_argument(
+    p_ncbi.add_argument(
         "--full_lineage",
         action=argparse.BooleanOptionalAction,
         help="Treat entries as full lineages",
     )
-    p_trans.add_argument(
+    p_ncbi.add_argument(
         "--output_full_lineage",
         action=argparse.BooleanOptionalAction,
         help="Add a column with the full GTDB lineage",
     )
-    p_trans.add_argument(
+    p_ncbi.add_argument(
         "--from_taxids",
         action=argparse.BooleanOptionalAction,
         help="Treat entries as NCBI tax IDs",
     )
-    p_trans.add_argument(
-        "--bundle",
-        default=None,
-        help="Path to a local .msgpack.zst bundle (downloads latest if omitted)",
+    p_ncbi.add_argument(
+        "--from_silva",
+        action=argparse.BooleanOptionalAction,
+        help="Sanitize input as SILVA lineages (remove sk__, replace _ with space, merge genus into species)",
     )
-    p_trans.add_argument(
-        "--version",
-        default=None,
-        help="GTDB version to download (default: latest release)",
+    p_ncbi.add_argument(
+        "--genus_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fall back to genus-level when exact species match fails (default: disabled)",
     )
-    p_trans.add_argument(
-        "--force",
+    p_ncbi.add_argument(
+        "--empty_on_fail",
         action="store_true",
-        help="Re-download the bundle even if cached locally",
+        help="Output empty string instead of 'no_translation' for failed lookups",
     )
+    _add_bundle_args(p_ncbi)
+
+    # -- forward -------------------------------------------------------
+    p_fwd = subparsers.add_parser(
+        "forward",
+        help="Forward-translate old GTDB names to the current release.",
+    )
+    p_fwd.add_argument("--in_file", required=True, help="Input CSV or TSV")
+    p_fwd.add_argument("--out_file", required=True, help="Output CSV")
+    p_fwd.add_argument(
+        "--column_name",
+        required=True,
+        help="Column containing old GTDB names to forward-translate",
+    )
+    p_fwd.add_argument(
+        "--out_column_name",
+        default="gtdb_forwarded",
+        help="Name for the output column (default: gtdb_forwarded)",
+    )
+    p_fwd.add_argument(
+        "--output_full_lineage",
+        action=argparse.BooleanOptionalAction,
+        help="Add a column with the full current GTDB lineage",
+    )
+    p_fwd.add_argument(
+        "--empty_on_fail",
+        action="store_true",
+        help="Output empty string instead of 'no_translation' for failed lookups",
+    )
+    _add_bundle_args(p_fwd)
 
     args = parser.parse_args(argv)
     if args.command is None:
@@ -210,8 +390,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "build":
         _build(args)
-    elif args.command == "translate":
-        _translate(args)
+    elif args.command == "ncbi":
+        _ncbi(args)
+    elif args.command == "forward":
+        _forward(args)
 
 
 if __name__ == "__main__":

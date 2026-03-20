@@ -74,9 +74,13 @@ class NCBITranslator:
         self
         """
         import pandas as pd  # deferred — only needed for building
+        import re
 
         # -- Step 1: NCBI/SILVA name → GTDB name (vote-based) -------------
         ncbi_votes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        # Separate rank-aligned votes: maps bare NCBI name → {GTDB name → count}
+        # Only from rank-by-rank lineage alignment, not organism names
+        rank_aligned_votes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         gtdb_name_to_lineage: Dict[str, str] = {}
 
         for fpath in metadata_paths:
@@ -112,7 +116,9 @@ class NCBITranslator:
                         ncbi_tax = unfiltered_ncbi_last
 
                     if not (len(ncbi_tax) == 3 or len(gtdb_tax) == 3):
-                        ncbi_votes[ncbi_tax[3:]][gtdb_tax] += 1
+                        bare = ncbi_tax[3:]
+                        ncbi_votes[bare][gtdb_tax] += 1
+                        rank_aligned_votes[bare][gtdb_tax] += 1
 
                     # SILVA 16S
                     if len(silva_lineage) == 7 or (
@@ -134,6 +140,30 @@ class NCBITranslator:
             ncbi: max(counter.items(), key=lambda x: x[1])[0]
             for ncbi, counter in ncbi_votes.items()
         }
+
+        # Build authoritative rank-aligned mapping (majority vote on
+        # rank-aligned votes only — not polluted by organism names)
+        rank_aligned: Dict[str, str] = {
+            ncbi: max(counter.items(), key=lambda x: x[1])[0]
+            for ncbi, counter in rank_aligned_votes.items()
+        }
+
+        # Post-process: fix genus and "sp." names using rank-aligned data.
+        # For bare genus names and "Genus sp.*" patterns, prefer the
+        # rank-aligned genus→genus mapping over the mixed vote.
+        _sp_pattern = re.compile(r"^(\S+)\s+sp\.?(?:\s|$)")
+        for name in list(ncbi_name_to_gtdb.keys()):
+            # Bare genus name (single word, capitalised)
+            if " " not in name and name[0:1].isupper():
+                if name in rank_aligned:
+                    ncbi_name_to_gtdb[name] = rank_aligned[name]
+            # "Genus sp." / "Genus sp. XYZ" patterns
+            else:
+                m = _sp_pattern.match(name)
+                if m:
+                    genus = m.group(1)
+                    if genus in rank_aligned:
+                        ncbi_name_to_gtdb[name] = rank_aligned[genus]
 
         # ensure every GTDB name (without prefix) maps to itself
         for fpath in metadata_paths:
@@ -160,14 +190,18 @@ class NCBITranslator:
                 if parts[3] == "scientific name":
                     ncbi_id_to_scientific[taxid] = name
 
-        # Resolve synonyms through scientific names
+        # Resolve synonyms through scientific names.
+        # Protect rank-aligned mappings from being overwritten.
+        protected = set(rank_aligned.keys())
         ncbi_rep_to_gtdb = {}
         for ncbi_name, gtdb_name in ncbi_name_to_gtdb.items():
             if ncbi_name in ncbi_name_to_id:
                 rep = ncbi_id_to_scientific.get(ncbi_name_to_id[ncbi_name], ncbi_name)
             else:
                 rep = ncbi_name
-            ncbi_rep_to_gtdb[rep] = gtdb_name
+            # Don't overwrite a rank-aligned mapping with a synonym-derived one
+            if rep not in protected or rep not in ncbi_rep_to_gtdb:
+                ncbi_rep_to_gtdb[rep] = gtdb_name
 
         expanded: Dict[str, str] = {}
         for ncbi_name, taxid in ncbi_name_to_id.items():
@@ -244,6 +278,7 @@ class NCBITranslator:
         entries: Sequence[str],
         sep: str = "|",
         full_lineage: bool = False,
+        genus_fallback: bool = False,
     ) -> List[str]:
         """Translate NCBI/SILVA names to GTDB.
 
@@ -257,6 +292,11 @@ class NCBITranslator:
         full_lineage : bool
             If ``True``, treat each entry as a complete lineage and
             return the best matching GTDB lineage.
+        genus_fallback : bool
+            If ``True``, fall back to binomial and genus-level
+            lookups when an exact match fails.  If ``False`` (default),
+            only try exact match, bracket removal, and parenthetical
+            removal.
 
         Returns
         -------
@@ -276,7 +316,7 @@ class NCBITranslator:
                 continue
             if full_lineage:
                 for ii, tax in enumerate(taxa):
-                    gtdb_name = self._lookup_name(tax)
+                    gtdb_name = self._lookup_name(tax, genus_fallback=genus_fallback)
                     if gtdb_name in self.gtdb_name_to_lineage:
                         best = self.gtdb_name_to_lineage[gtdb_name]
                         if best.count(";") >= len(taxa) - ii:
@@ -288,7 +328,7 @@ class NCBITranslator:
             else:
                 parts = []
                 for tax in taxa:
-                    gtdb_name = self._lookup_name(tax)
+                    gtdb_name = self._lookup_name(tax, genus_fallback=genus_fallback)
                     if gtdb_name is not None and gtdb_name != "none":
                         parts.append(gtdb_name[3:])
                     else:
@@ -348,7 +388,7 @@ class NCBITranslator:
                 translations[i] = sep.join(parts)
         return translations
 
-    def _lookup_name(self, name: str) -> Optional[str]:
+    def _lookup_name(self, name: str, genus_fallback: bool = False) -> Optional[str]:
         """Look up a single NCBI name with progressive fallbacks.
 
         Tries, in order:
@@ -357,43 +397,68 @@ class NCBITranslator:
         2. Bracket removal  (``[Clostridium]`` → ``Clostridium``)
         3. Parenthetical removal  (``Klebsiella pneumoniae (resistant)``
            → ``Klebsiella pneumoniae``)
+
+        If *genus_fallback* is ``True``, also tries:
+
         4. Binomial (first two words)  — strips strain IDs like
            ``Acinetobacter baumannii AB03``
            → ``Acinetobacter baumannii``
+           Skipped when the second word is ``sp.``, ``sp``, ``spp.``,
+           or ``spp`` (these are genus-level, not true binomials).
         5. Genus only  (``Bombilactobacillus sp.``
            → ``Bombilactobacillus``)
+
+        At each step, ``"none"`` values in the dictionary are treated as
+        misses so that the fallback chain continues.
         """
+        def _get(key: str) -> Optional[str]:
+            """Return dict value if it exists and isn't 'none'."""
+            val = self.ncbi_name_to_gtdb.get(key)
+            if val is not None and val != "none":
+                return val
+            return None
+
         # 1. Exact
-        if name in self.ncbi_name_to_gtdb:
-            return self.ncbi_name_to_gtdb[name]
+        result = _get(name)
+        if result is not None:
+            return result
 
         # 2. Bracket removal
         if "[" in name:
             cleaned = name.replace("[", "").replace("]", "")
-            if cleaned in self.ncbi_name_to_gtdb:
-                return self.ncbi_name_to_gtdb[cleaned]
+            result = _get(cleaned)
+            if result is not None:
+                return result
             # Continue with cleaned version for further fallbacks
             name = cleaned
 
         # 3. Parenthetical removal
         if "(" in name:
             stripped = name.split("(")[0].strip()
-            if stripped in self.ncbi_name_to_gtdb:
-                return self.ncbi_name_to_gtdb[stripped]
+            result = _get(stripped)
+            if result is not None:
+                return result
             name = stripped
 
+        if not genus_fallback:
+            return None
+
         # 4. Binomial (first two words) — catches strain suffixes
+        #    Skip if second word is sp./spp. — that's genus-level, not a binomial
+        _SP_WORDS = {"sp.", "sp", "spp.", "spp"}
         words = name.split()
-        if len(words) > 2:
+        if len(words) > 2 and words[1] not in _SP_WORDS:
             binomial = f"{words[0]} {words[1]}"
-            if binomial in self.ncbi_name_to_gtdb:
-                return self.ncbi_name_to_gtdb[binomial]
+            result = _get(binomial)
+            if result is not None:
+                return result
 
         # 5. Genus only — catches "Genus sp." and bare genus names
         if len(words) >= 1:
             genus = words[0]
-            if genus in self.ncbi_name_to_gtdb:
-                return self.ncbi_name_to_gtdb[genus]
+            result = _get(genus)
+            if result is not None:
+                return result
 
         return None
 
@@ -409,6 +474,7 @@ class NCBITranslator:
         * ``ncbi_id_to_scientific``
         * ``gtdb_name_to_lineage``
         * ``forward_trans_dict`` (if a forward translator is attached)
+        * ``forward_rank_dicts`` (per-rank forward translations)
         * ``version``
         """
         data = {
@@ -418,6 +484,9 @@ class NCBITranslator:
             "gtdb_name_to_lineage": self.gtdb_name_to_lineage,
             "forward_trans_dict": (
                 self.forward.translation_dict if self.forward else {}
+            ),
+            "forward_rank_dicts": (
+                self.forward.rank_translation_dicts if self.forward else {}
             ),
         }
         save_bundle(data, path)
@@ -449,9 +518,11 @@ class NCBITranslator:
         obj.ncbi_id_to_scientific = data["ncbi_id_to_scientific"]
         obj.gtdb_name_to_lineage = data["gtdb_name_to_lineage"]
         fwd_dict = data.get("forward_trans_dict", {})
-        if fwd_dict:
+        fwd_rank_dicts = data.get("forward_rank_dicts", {})
+        if fwd_dict or fwd_rank_dicts:
             obj.forward = ForwardTranslator()
             obj.forward._trans_dict = fwd_dict
+            obj.forward._rank_trans_dicts = fwd_rank_dicts
         return obj
 
     # ------------------------------------------------------------------

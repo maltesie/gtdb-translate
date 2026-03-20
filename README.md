@@ -1,7 +1,7 @@
 # gtdb-translate
 
 Translate taxonomy names from NCBI/SILVA to GTDB, and forward-translate
-renamed GTDB species across releases.
+renamed GTDB names across releases.
 
 Pre-built translation dictionaries are downloaded automatically from the
 [latest release](https://github.com/maltesie/gtdb-translate/releases)
@@ -13,14 +13,10 @@ on first use — no manual setup required.
 pip install git+https://github.com/maltesie/gtdb-translate.git
 ```
 
-## Translating a table
-
-The most common use case: you have a CSV or TSV with a column of NCBI
-taxonomy names (or tax IDs, or full lineages) and want to add a column
-with the corresponding GTDB names.
+## Translating NCBI/SILVA names to GTDB
 
 ```bash
-gtdb-translate translate \
+gtdb-translate ncbi \
     --in_file my_data.tsv \
     --out_file my_data_translated.csv \
     --column_name taxonomy
@@ -30,8 +26,7 @@ On first run, the tool automatically downloads the translation bundle
 for the latest GTDB release and caches it in `~/.cache/gtdb_translate/`.
 
 If you omit `--column_name`, the tool will try to auto-detect which
-column contains translatable names by sampling a few rows against the
-dictionary.
+column contains translatable names.
 
 ### Options
 
@@ -43,7 +38,9 @@ dictionary.
 --full_lineage      Treat entries as full lineages
 --output_full_lineage  Add a column with the full GTDB lineage
 --from_taxids       Treat entries as NCBI tax IDs instead of names
---version           GTDB release to target (default: latest release)
+--from_silva        Sanitize SILVA lineages before translation
+--genus_fallback    Fall back to genus when species match fails (default: off)
+--version           GTDB release to translate against (default: latest)
 --bundle            Path to a local bundle file (skips download)
 ```
 
@@ -52,7 +49,7 @@ dictionary.
 Translate a column of species names:
 
 ```bash
-gtdb-translate translate \
+gtdb-translate ncbi \
     --in_file samples.csv \
     --out_file samples_gtdb.csv \
     --column_name species
@@ -61,7 +58,7 @@ gtdb-translate translate \
 Translate NCBI tax IDs with full lineage output:
 
 ```bash
-gtdb-translate translate \
+gtdb-translate ncbi \
     --in_file otus.tsv \
     --out_file otus_gtdb.csv \
     --column_name tax_id \
@@ -69,34 +66,38 @@ gtdb-translate translate \
     --full_lineage
 ```
 
-Translate full NCBI lineages (e.g. from SILVA or QIIME):
+Translate SILVA lineages:
 
 ```bash
-gtdb-translate translate \
+gtdb-translate ncbi \
     --in_file silva_table.csv \
     --out_file silva_gtdb.csv \
     --column_name lineage \
+    --from_silva \
     --full_lineage \
     --lineage_sep ";"
 ```
 
-Pin to a specific GTDB release:
+## Forward-translating old GTDB names
+
+If you have a table with GTDB names from an older release:
 
 ```bash
-gtdb-translate translate \
-    --in_file data.tsv \
-    --out_file data_gtdb.csv \
-    --column_name taxonomy \
-    --version r226
+gtdb-translate forward \
+    --in_file old_data.csv \
+    --out_file updated_data.csv \
+    --column_name host_species \
+    --output_full_lineage
 ```
 
-## Building your own bundle
+This checks each name against the current GTDB. Names already present
+are kept as-is. Outdated names are forward-mapped to their current
+equivalents. Names that cannot be resolved get `no_translation`.
 
-If you want to build translation dictionaries yourself (e.g. for a
-newer GTDB release before an official bundle is published), you need
-the GTDB metadata TSVs, NCBI `names.dmp`, and optionally the
-[gtdb-taxdump](https://github.com/shenwei356/gtdb-taxdump) changelog
-for forward translation of renamed species:
+Works at all taxonomic ranks — species, genus, family, order, class,
+and phylum names are all forward-translated.
+
+## Building your own bundle
 
 ```bash
 gtdb-translate build \
@@ -107,33 +108,23 @@ gtdb-translate build \
     -o gtdb_translate_r226.msgpack.zst
 ```
 
-The resulting `.msgpack.zst` bundle can be used locally with
-`--bundle path/to/file` or uploaded as a GitHub release for others to
-download automatically.
-
 ## Bundle format
 
 Bundles are serialized with msgpack + zstandard for fast loading and
-compact size. Legacy `translation_dicts_rXXX.json.gz` files (from
-earlier versions of this tool) are also supported.
+compact size. Legacy `translation_dicts_rXXX.json.gz` files are also
+supported by `NCBITranslator.load()`.
 
 ---
 
 ## Python API
-
-All functionality is also available as a Python package for use in
-scripts and pipelines.
 
 ### Quick start
 
 ```python
 from gtdb_translate import NCBITranslator
 
-# Auto-downloads the latest bundle on first use (~/.cache/gtdb_translate/)
+# Auto-downloads the latest bundle
 t = NCBITranslator.default()
-
-# Or pin to a specific version
-t = NCBITranslator.default(version="r226")
 
 # Translate NCBI names → GTDB
 t.translate(["Escherichia coli", "Staphylococcus aureus"])
@@ -141,16 +132,23 @@ t.translate(["Escherichia coli", "Staphylococcus aureus"])
 # Translate NCBI tax IDs → GTDB
 t.translate_ids(["562", "1280"])
 
-# Forward-translate renamed GTDB species (included in the bundle)
+# Forward-translate old GTDB species names
 if t.forward:
-    t.forward.translate("Lactobacillus oldname")
+    t.forward.translate("Bacillus_C megaterium")
+
+    # Forward-translate at a specific rank
+    t.forward.translate_rank("Firmicutes", "phylum")
+
+    # Forward-translate a full lineage (bottom-up, validates against current GTDB)
+    t.forward.translate_lineage(
+        "d__Bacteria;p__Firmicutes;g__Bacillus_C;s__Bacillus_C megaterium",
+        t.gtdb_name_to_lineage,
+    )
 ```
 
 ### Building from Python
 
 ```python
-from gtdb_translate import NCBITranslator
-
 t = NCBITranslator(version="r226")
 t.build(
     metadata_paths=["bac120_metadata_r226.tsv", "ar53_metadata_r226.tsv"],
@@ -158,12 +156,6 @@ t.build(
     changelog_path="gtdb-taxid-changelog.csv",
 )
 t.save("gtdb_translate_r226.msgpack.zst")
-```
-
-### Loading a local bundle
-
-```python
-t = NCBITranslator.load("gtdb_translate_r226.msgpack.zst")
 ```
 
 ### Using components independently
@@ -175,11 +167,12 @@ from gtdb_translate import GTDBTaxonomy, ForwardTranslator
 tax = GTDBTaxonomy.from_tsv("bac120_taxonomy_r226.tsv")
 tax.get_rank("Bacillus subtilis", "phylum")  # → "Bacillota"
 
-# Forward translator (standalone, without NCBI dicts)
+# Forward translator (standalone)
 fwd = ForwardTranslator()
 fwd.build("gtdb-taxid-changelog.csv")
 fwd.save("forward.json")
 
 fwd = ForwardTranslator.load("forward.json")
-fwd.translate("Lactobacillus oldname")
+fwd.translate("Bacillus_C megaterium")
+fwd.translate_rank("Firmicutes", "phylum")
 ```
