@@ -410,11 +410,23 @@ class NCBITranslator:
 
         At each step, ``"none"`` values in the dictionary are treated as
         misses so that the fallback chain continues.
+
+        If the input matches a ``"Genus sp."`` / ``"Genus spp."`` pattern,
+        species-level results (``s__...``) are rejected so that the lookup
+        naturally falls through to a genus-level result.
         """
+        import re
+
+        _SP_PATTERN = re.compile(r"^(\S+)\s+spp?\.?$")
+        is_sp_input = bool(_SP_PATTERN.match(name.strip()))
+
         def _get(key: str) -> Optional[str]:
-            """Return dict value if it exists and isn't 'none'."""
+            """Return dict value if it exists and isn't 'none'.
+            Rejects species-level results for sp. inputs."""
             val = self.ncbi_name_to_gtdb.get(key)
             if val is not None and val != "none":
+                if is_sp_input and val.startswith("s__"):
+                    return None
                 return val
             return None
 
