@@ -82,6 +82,8 @@ class NCBITranslator:
         # Only from rank-by-rank lineage alignment, not organism names
         rank_aligned_votes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
         gtdb_name_to_lineage: Dict[str, str] = {}
+        # SILVA lineages containing these are organellar (host, not bacterium)
+        _organellar = {"Mitochondria", "Chloroplast"}
 
         for fpath in metadata_paths:
             logger.info("Parsing metadata: %s", fpath)
@@ -120,20 +122,22 @@ class NCBITranslator:
                         ncbi_votes[bare][gtdb_tax] += 1
                         rank_aligned_votes[bare][gtdb_tax] += 1
 
-                    # SILVA 16S
+                    # SILVA 16S (skip organellar: Mitochondria / Chloroplast)
                     if len(silva_lineage) == 7 or (
                         ii + 1 < len(silva_lineage) < 7
                     ):
-                        silva_tax = silva_lineage[ii].split("str.")[0].strip()
-                        ncbi_votes[silva_tax][gtdb_tax] += 1
+                        if not _organellar.intersection(silva_lineage):
+                            silva_tax = silva_lineage[ii].split("str.")[0].strip()
+                            ncbi_votes[silva_tax][gtdb_tax] += 1
                     # SILVA 23S fallback
                     elif len(silva_23s_lineage) == 7 or (
                         ii + 1 < len(silva_23s_lineage) < 7
                     ):
-                        silva_tax = (
-                            silva_23s_lineage[ii].split("str.")[0].strip()
-                        )
-                        ncbi_votes[silva_tax][gtdb_tax] += 1
+                        if not _organellar.intersection(silva_23s_lineage):
+                            silva_tax = (
+                                silva_23s_lineage[ii].split("str.")[0].strip()
+                            )
+                            ncbi_votes[silva_tax][gtdb_tax] += 1
 
         # majority vote → single best GTDB name per NCBI name
         ncbi_name_to_gtdb: Dict[str, str] = {

@@ -335,7 +335,7 @@ class ForwardTranslator:
         lineage: str,
         gtdb_name_to_lineage: Dict[str, str],
         sep: str = ";",
-    ) -> str:
+    ) -> Optional[str]:
         """Forward-translate a GTDB lineage to its current form.
 
         Works bottom-up from the lowest rank: if a taxon exists in the
@@ -343,6 +343,9 @@ class ForwardTranslator:
         directly (capturing any higher-rank renames).  If the lowest
         rank is not found, it is forward-mapped first, then looked up
         again.  Falls back to progressively higher ranks.
+
+        Every returned lineage is guaranteed to come from
+        *gtdb_name_to_lineage* and therefore be in the current GTDB.
 
         Parameters
         ----------
@@ -357,9 +360,9 @@ class ForwardTranslator:
 
         Returns
         -------
-        str
-            The current lineage, or the original if nothing could be
-            resolved.
+        str or None
+            The current lineage from the dict, or ``None`` if nothing
+            could be resolved.
         """
         prefix_to_rank = {
             "s": "species",
@@ -401,8 +404,7 @@ class ForwardTranslator:
                 if mapped_prefixed in gtdb_name_to_lineage:
                     return gtdb_name_to_lineage[mapped_prefixed]
 
-        # Nothing resolved — return original
-        return lineage
+        return None
 
     def has_translation(self, species: str) -> bool:
         """Return ``True`` if *species* has a known forward mapping."""

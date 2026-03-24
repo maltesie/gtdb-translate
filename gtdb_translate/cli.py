@@ -106,14 +106,20 @@ def _ncbi(args: argparse.Namespace) -> None:
         ]
 
     if args.output_full_lineage:
-        def lookup_lineage(name):
-            if not name:
+        def lookup_lineage_single(name):
+            if not name or name == "no_translation":
                 return ""
             for prefix in ("s__", "g__", "f__", "o__", "c__", "p__", "d__"):
                 result = translator.gtdb_name_to_lineage.get(prefix + name)
                 if result:
                     return result
             return ""
+
+        def lookup_lineage(entry):
+            if not entry or entry == "no_translation":
+                return ""
+            parts = entry.split(args.sep)
+            return args.sep.join(lookup_lineage_single(p.strip()) for p in parts)
 
         df[args.out_column_name + "_lineage"] = [
             lookup_lineage(t) for t in df[args.out_column_name]
@@ -195,7 +201,29 @@ def _forward(args: argparse.Namespace) -> None:
 
         return NO_TRANS
 
-    df[args.out_column_name] = [forward_one(v) for v in df[column_name]]
+    sep = args.sep
+
+    def forward_entry(entry: str) -> str:
+        """Forward-translate an entry that may contain multiple names."""
+        if not isinstance(entry, str) or not entry.strip():
+            return NO_TRANS
+        parts = entry.split(sep)
+        if args.full_lineage:
+            translated = []
+            for part in parts:
+                part = part.strip()
+                if not part:
+                    translated.append(NO_TRANS)
+                    continue
+                result = fwd.translate_lineage(part, lineage_dict)
+                translated.append(result if result is not None else NO_TRANS)
+        else:
+            translated = [forward_one(p.strip()) for p in parts]
+        if all(t == NO_TRANS for t in translated):
+            return NO_TRANS
+        return sep.join(translated)
+
+    df[args.out_column_name] = [forward_entry(v) for v in df[column_name]]
 
     # Count results
     n_total = len(df)
@@ -207,9 +235,9 @@ def _forward(args: argparse.Namespace) -> None:
     print(f"  Forward-mapped:  {n_mapped}")
     print(f"  No translation:  {n_total - n_translated}")
 
-    # Optional lineage column
-    if args.output_full_lineage:
-        def get_lineage(name):
+    # Optional lineage column (skip if --full_lineage, output is already a lineage)
+    if args.output_full_lineage and not args.full_lineage:
+        def get_lineage_single(name):
             if name == NO_TRANS:
                 return ""
             for prefix, _ in RANK_PREFIXES:
@@ -217,6 +245,12 @@ def _forward(args: argparse.Namespace) -> None:
                 if result:
                     return result
             return ""
+
+        def get_lineage(entry):
+            if entry == NO_TRANS:
+                return ""
+            parts = entry.split(sep)
+            return sep.join(get_lineage_single(p.strip()) for p in parts)
 
         df[args.out_column_name + "_lineage"] = [
             get_lineage(t) for t in df[args.out_column_name]
@@ -370,6 +404,16 @@ def main(argv: list[str] | None = None) -> None:
         "--out_column_name",
         default="gtdb_forwarded",
         help="Name for the output column (default: gtdb_forwarded)",
+    )
+    p_fwd.add_argument(
+        "--sep",
+        default="|",
+        help="Separator for multiple names per cell (default: |)",
+    )
+    p_fwd.add_argument(
+        "--full_lineage",
+        action=argparse.BooleanOptionalAction,
+        help="Treat entries as full GTDB lineages (e.g. d__Bacteria;p__Firmicutes;...)",
     )
     p_fwd.add_argument(
         "--output_full_lineage",
