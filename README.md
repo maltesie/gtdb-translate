@@ -38,9 +38,9 @@ column contains translatable names.
 --full_lineage      Treat entries as full lineages
 --output_full_lineage  Add a column with the full GTDB lineage
 --from_taxids       Treat entries as NCBI tax IDs instead of names
---from_silva        Sanitize SILVA lineages before translation
+--from_silva        Sanitize SILVA lineages before translation (sk__ and k__ to d__)
 --genus_fallback    Fall back to genus when species match fails (default: off)
---version           GTDB release to translate against (default: latest)
+--version           GTDB release to translate against (default: latest, currently the only option)
 --bundle            Path to a local bundle file (skips download)
 ```
 
@@ -63,7 +63,7 @@ gtdb-translate ncbi \
     --out_file otus_gtdb.csv \
     --column_name tax_id \
     --from_taxids \
-    --full_lineage
+    --output_full_lineage
 ```
 
 Translate SILVA lineages:
@@ -99,6 +99,10 @@ and phylum names are all forward-translated.
 
 ## Building your own bundle
 
+Bundles contain several dictionaries for translating to a specific 
+version of GTDB. The currently only supported version is GTDB r226.
+You can build your own bundle for an older version:
+
 ```bash
 gtdb-translate build \
     --metadata bac120_metadata_r226.tsv ar53_metadata_r226.tsv \
@@ -107,12 +111,6 @@ gtdb-translate build \
     --version r226 \
     -o gtdb_translate_r226.msgpack.zst
 ```
-
-## Bundle format
-
-Bundles are serialized with msgpack + zstandard for fast loading and
-compact size. Legacy `translation_dicts_rXXX.json.gz` files are also
-supported by `NCBITranslator.load()`.
 
 ---
 
