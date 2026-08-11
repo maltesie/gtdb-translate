@@ -3,7 +3,8 @@
 Subcommands
 -----------
 build    Build a translation bundle from raw GTDB + NCBI files.
-ncbi     Batch-translate NCBI/SILVA names or tax IDs to GTDB.
+ncbi     Batch-translate NCBI names or tax IDs to GTDB.
+silva    Batch-translate SILVA taxonomy to GTDB.
 forward  Forward-translate old GTDB names to the current release.
 """
 
@@ -16,22 +17,48 @@ from pathlib import Path
 
 
 def _build(args: argparse.Namespace) -> None:
+    from .build import SILVA_COLUMNS
     from .ncbi import NCBITranslator
 
-    translator = NCBITranslator(version=args.version)
-    translator.build(
+    silva_columns = SILVA_COLUMNS
+    if args.no_silva:
+        silva_columns = ()
+    elif args.silva_columns:
+        silva_columns = tuple(args.silva_columns)
+
+    translator = NCBITranslator.build(
         metadata_paths=args.metadata,
         names_dmp_path=args.names_dmp,
         changelog_path=args.changelog,
+        version=args.version,
+        silva_columns=silva_columns,
     )
+
     out = args.output or f"gtdb_translate_{args.version}.msgpack.zst"
     translator.save(out)
     print(f"Bundle saved to {out}")
     print(f"  NCBI mappings:        {len(translator.ncbi_name_to_gtdb):,}")
-    print(f"  NCBI ID → scientific: {len(translator.ncbi_id_to_scientific):,}")
+    print(f"  NCBI ID -> scientific: {len(translator.ncbi_id_to_scientific):,}")
     print(f"  GTDB lineage entries: {len(translator.gtdb_name_to_lineage):,}")
+    n_silva = sum(len(d) for d in translator.silva_name_to_gtdb.values())
+    print(f"  SILVA tokens:         {n_silva:,}")
     if translator.forward:
         print(f"  Forward translations: {translator.forward}")
+
+    if not args.self_test:
+        return
+
+    from .selftest import format_report, run_self_test
+
+    result = run_self_test(
+        translator,
+        metadata_paths=args.metadata,
+        silva_columns=silva_columns,
+        limit=args.self_test_limit,
+    )
+    print(format_report(result))
+    if not result.passed:
+        sys.exit(2)
 
 
 def _load_translator(args: argparse.Namespace):
@@ -53,20 +80,15 @@ def _read_table(path: str):
     return pd.read_csv(path, dtype=str, sep=sep_in)
 
 
-# -- ncbi subcommand (was: translate) -------------------------------------
-
 def _ncbi(args: argparse.Namespace) -> None:
     import pandas as pd
-
-    from .ncbi import NCBITranslator
 
     translator = _load_translator(args)
     df = _read_table(args.in_file)
 
-    # Detect or validate column
     column_name = args.column_name
     if column_name is None:
-        column_name = translator.detect_column(df, sep=args.sep)
+        column_name = translator.detect_column(df, sep=args.multi_sep or "|")
         if column_name is None:
             print(
                 "ERROR: Could not auto-detect the column to translate. "
@@ -76,63 +98,213 @@ def _ncbi(args: argparse.Namespace) -> None:
             sys.exit(1)
         print(f"Auto-detected column: '{column_name}'")
 
+    detected = translator.detect_format(df, column_name)
+    from_taxids = args.from_taxids if args.from_taxids is not None else detected["from_taxids"]
+    full_lineage = args.full_lineage if args.full_lineage is not None else detected["is_full_lineage"]
+    multi_sep = args.multi_sep if args.multi_sep is not None else "|"
+    lineage_sep = args.lineage_sep if args.lineage_sep is not None else (
+        detected["sep"] if full_lineage else ";"
+    )
+
+    auto_notes = []
+    if args.from_taxids is None:
+        auto_notes.append(f"from_taxids={from_taxids}")
+    if args.full_lineage is None:
+        auto_notes.append(f"full_lineage={full_lineage}")
+    if args.lineage_sep is None and full_lineage and not from_taxids:
+        auto_notes.append(f"lineage_sep={lineage_sep!r}")
+    if auto_notes:
+        print(f"Auto-detected format: {', '.join(auto_notes)}")
+
     column = df[column_name]
 
-    # Sanitize SILVA lineages (opt-in)
-    if args.from_silva and not args.from_taxids:
-        column = NCBITranslator.sanitize_lineages(
-            column,
-            lineage_sep=args.lineage_sep,
-            check_merge_species=True,
-            replace_symbols={"_": " "},
-            check_remove_sk=True,
+    if from_taxids:
+        # Always request lineages: the output column carries the full
+        # lineage regardless of the input shape.
+        translations, purity, support = translator.translate_ids(
+            column, sep=multi_sep, full_lineage=True, with_support=True,
         )
-
-    # Translate
-    if args.from_taxids:
-        df[args.out_column_name] = translator.translate_ids(
-            column, sep=args.lineage_sep, full_lineage=args.full_lineage
+    elif full_lineage:
+        translations, purity, support = translator.translate(
+            column, sep=lineage_sep, full_lineage=True,
+            genus_fallback=args.genus_fallback, multi_sep=multi_sep,
+            with_support=True,
         )
     else:
-        df[args.out_column_name] = translator.translate(
-            column, sep=args.lineage_sep, full_lineage=args.full_lineage,
-            genus_fallback=args.genus_fallback,
+        translations, purity, support = translator.translate(
+            column, sep=multi_sep, full_lineage=False,
+            genus_fallback=args.genus_fallback, with_support=True,
         )
 
-    # Optional extras
-    if args.full_lineage:
-        df[column_name + "_lowest"] = [
-            t.split(args.lineage_sep)[-1] for t in df[args.out_column_name]
-        ]
+    # tax-ID translation already returns lineages when asked; names do not.
+    returns_lineage = True if from_taxids else full_lineage
+    _attach_outputs(
+        df, args, translator, translations, returns_lineage,
+        multi_sep, lineage_sep,
+    )
+    _attach_support(df, args, purity, support)
 
-    if args.output_full_lineage:
-        def lookup_lineage_single(name):
-            if not name or name == "no_translation":
-                return ""
-            for prefix in ("s__", "g__", "f__", "o__", "c__", "p__", "d__"):
-                result = translator.gtdb_name_to_lineage.get(prefix + name)
-                if result:
-                    return result
-            return ""
-
-        def lookup_lineage(entry):
-            if not entry or entry == "no_translation":
-                return ""
-            parts = entry.split(args.sep)
-            return args.sep.join(lookup_lineage_single(p.strip()) for p in parts)
-
-        df[args.out_column_name + "_lineage"] = [
-            lookup_lineage(t) for t in df[args.out_column_name]
-        ]
-
-    if args.empty_on_fail:
-        df[args.out_column_name] = df[args.out_column_name].replace("no_translation", "")
+    _apply_empty_on_fail(df, args)
 
     df.to_csv(args.out_file, index=False)
     print(f"Output written to {args.out_file}")
 
+NO_TRANS = "no_translation"
+
+#: Rank prefixes tried, most specific first, when resolving a bare GTDB
+#: name back to its full lineage.
+_RANK_PREFIXES = ("s__", "g__", "f__", "o__", "c__", "p__", "d__")
+
+
+def _attach_support(df, args, purity, support) -> None:
+    """Add purity and support columns unless the user opted out."""
+    if not args.report_purity:
+        return
+    df[args.out_column_name + "_purity"] = purity
+    df[args.out_column_name + "_support"] = support
+
+
+def _map_parts(values, multi_sep, per_part):
+    """Apply *per_part* to each part of every entry, preserving joins.
+
+    An entry that is ``no_translation``, or whose parts all fail, stays
+    ``no_translation`` so the failure marker never turns into an empty
+    cell halfway through the pipeline.
+    """
+    out = []
+    for entry in values:
+        if not isinstance(entry, str) or not entry or entry == NO_TRANS:
+            out.append(NO_TRANS)
+            continue
+        parts = entry.split(multi_sep) if multi_sep else [entry]
+        mapped = [per_part(p.strip()) for p in parts]
+        if all(m in ("", NO_TRANS) for m in mapped):
+            out.append(NO_TRANS)
+        elif multi_sep:
+            out.append(multi_sep.join(m or NO_TRANS for m in mapped))
+        else:
+            out.append(mapped[0] or NO_TRANS)
+    return out
+
+
+def _lineage_of_name(translator, name):
+    """Resolve a bare GTDB name to its full lineage, deepest rank first."""
+    if not name or name == NO_TRANS:
+        return NO_TRANS
+    for prefix in _RANK_PREFIXES:
+        lineage = translator.gtdb_name_to_lineage.get(prefix + name)
+        if lineage:
+            return lineage
+    return NO_TRANS
+
+
+def _lowest_of_lineage(lineage, lineage_sep):
+    """Take the most specific rank of a lineage, without its prefix."""
+    if not lineage or lineage == NO_TRANS:
+        return NO_TRANS
+    from .utils import strip_rank_prefix
+
+    return strip_rank_prefix(lineage.split(lineage_sep)[-1])
+
+
+def _apply_empty_on_fail(df, args) -> None:
+    """Blank the failure marker in every column that can carry it."""
+    if not args.empty_on_fail:
+        return
+    for column in (args.out_column_name, args.out_column_name + "_lowest"):
+        if column in df.columns:
+            df[column] = df[column].replace(NO_TRANS, "")
+
+
+def _attach_outputs(
+    df, args, translator, direct, is_lineage, multi_sep, lineage_sep
+) -> None:
+    """Write the lineage column, and the lowest-rank column if requested.
+
+    *direct* is whatever the translator returned: already a lineage when
+    the input was lineage-shaped, otherwise bare taxon names.  The output
+    column always ends up carrying the full lineage either way, so the
+    shape of the output no longer depends on the shape of the input.
+    """
+    if is_lineage:
+        lineages = direct
+        lowest = _map_parts(
+            direct, multi_sep, lambda p: _lowest_of_lineage(p, lineage_sep)
+        )
+    else:
+        lineages = _map_parts(
+            direct, multi_sep, lambda p: _lineage_of_name(translator, p)
+        )
+        lowest = direct
+
+    df[args.out_column_name] = lineages
+    if args.output_lowest_rank:
+        df[args.out_column_name + "_lowest"] = lowest
+
+
+def _silva(args: argparse.Namespace) -> None:
+    from .silva import SILVATranslator
+
+    translator = _load_translator(args)
+    silva = SILVATranslator.from_ncbi(translator)
+
+    df = _read_table(args.in_file)
+
+    column_name = args.column_name
+    if column_name is None:
+        column_name = translator.detect_column(df, sep=args.multi_sep or "|")
+        if column_name is None:
+            print(
+                "ERROR: Could not auto-detect the column to translate. "
+                "Use --column_name to specify it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"Auto-detected column: '{column_name}'")
+
+    detected = translator.detect_format(df, column_name)
+    full_lineage = (
+        args.full_lineage
+        if args.full_lineage is not None
+        else detected["is_full_lineage"]
+    )
+    lineage_sep = args.lineage_sep or detected["sep"] or ";"
+
+    auto_notes = []
+    if args.full_lineage is None:
+        auto_notes.append(f"full_lineage={full_lineage}")
+    if args.lineage_sep is None:
+        auto_notes.append(f"lineage_sep={lineage_sep!r}")
+    if auto_notes:
+        print(f"Auto-detected format: {', '.join(auto_notes)}")
+
+    translations, purity, support = silva.translate(
+        df[column_name],
+        sep=lineage_sep,
+        full_lineage=full_lineage,
+        genus_fallback=args.genus_fallback,
+        multi_sep=args.multi_sep,
+        with_support=True,
+    )
+    _attach_outputs(
+        df, args, translator, translations, full_lineage,
+        args.multi_sep, lineage_sep,
+    )
+    _attach_support(df, args, purity, support)
+
+    n_ok = sum(1 for t in translations if t != NO_TRANS)
+    print(f"SILVA translation: {n_ok}/{len(translations)} entries translated")
+
+    _apply_empty_on_fail(df, args)
+
+    df.to_csv(args.out_file, index=False)
+    print(f"Output written to {args.out_file}")
+
+
 def _forward(args: argparse.Namespace) -> None:
     import pandas as pd
+
+    from .utils import split_rank_prefix
 
     translator = _load_translator(args)
 
@@ -155,11 +327,23 @@ def _forward(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    NO_TRANS = "no_translation"
+    detected = translator.detect_format(df, column_name)
+    full_lineage = args.full_lineage if args.full_lineage is not None else detected["is_full_lineage"]
+    lineage_sep = args.lineage_sep if args.lineage_sep is not None else (
+        detected["sep"] if full_lineage else ";"
+    )
+
+    auto_notes = []
+    if args.full_lineage is None:
+        auto_notes.append(f"full_lineage={full_lineage}")
+    if args.lineage_sep is None:
+        auto_notes.append(f"lineage_sep={lineage_sep!r}")
+    if auto_notes:
+        print(f"Auto-detected format: {', '.join(auto_notes)}")
+
     fwd = translator.forward
     lineage_dict = translator.gtdb_name_to_lineage
 
-    # Prefixes to try, from most specific to least
     RANK_PREFIXES = [
         ("s__", "species"),
         ("g__", "genus"),
@@ -180,90 +364,109 @@ def _forward(args: argparse.Namespace) -> None:
         if not isinstance(name, str) or not name.strip():
             return NO_TRANS
 
-        name = name.strip()
+        _, name = split_rank_prefix(name.strip())
 
-        # 1. Already in current GTDB?
         for prefix, rank in RANK_PREFIXES:
             if (prefix + name) in lineage_dict:
                 return name
 
-        # 2. Try forward mapping
-        # Species-level (contains a space)
         if " " in name:
             mapped = fwd.translate(name)
             if mapped != name and ("s__" + mapped) in lineage_dict:
                 return mapped
-        # Try all rank dicts
-        for prefix, rank in RANK_PREFIXES[1:]:  # skip species
+        for prefix, rank in RANK_PREFIXES[1:]:
             mapped = fwd.translate_rank(name, rank)
             if mapped != name and (prefix + mapped) in lineage_dict:
                 return mapped
 
         return NO_TRANS
 
-    sep = args.sep
+    multi_sep = args.multi_sep
 
     def forward_entry(entry: str) -> str:
         """Forward-translate an entry that may contain multiple names."""
         if not isinstance(entry, str) or not entry.strip():
             return NO_TRANS
-        parts = entry.split(sep)
-        if args.full_lineage:
+        parts = entry.split(multi_sep)
+        if full_lineage:
             translated = []
             for part in parts:
                 part = part.strip()
                 if not part:
                     translated.append(NO_TRANS)
                     continue
-                result = fwd.translate_lineage(part, lineage_dict)
+                result = fwd.translate_lineage(part, lineage_dict, sep=lineage_sep)
                 translated.append(result if result is not None else NO_TRANS)
         else:
             translated = [forward_one(p.strip()) for p in parts]
         if all(t == NO_TRANS for t in translated):
             return NO_TRANS
-        return sep.join(translated)
+        return multi_sep.join(translated)
 
-    df[args.out_column_name] = [forward_entry(v) for v in df[column_name]]
+    forwarded = [forward_entry(v) for v in df[column_name]]
+    _attach_outputs(
+        df, args, translator, forwarded, full_lineage,
+        multi_sep, lineage_sep,
+    )
 
-    # Count results
+    def _bare_entry(entry):
+        if not isinstance(entry, str) or not entry.strip():
+            return entry
+        return multi_sep.join(split_rank_prefix(p.strip())[1] for p in entry.split(multi_sep))
+
+    bare_input = df[column_name].map(_bare_entry)
     n_total = len(df)
-    n_translated = (df[args.out_column_name] != NO_TRANS).sum()
-    n_unchanged = (df[args.out_column_name] == df[column_name]).sum()
+    n_translated = sum(1 for v in forwarded if v != NO_TRANS)
+    n_unchanged = sum(
+        1 for v, b in zip(forwarded, bare_input) if v == b
+    )
     n_mapped = n_translated - n_unchanged
     print(f"Forward mapping: {n_total} entries")
     print(f"  Already current: {n_unchanged}")
     print(f"  Forward-mapped:  {n_mapped}")
     print(f"  No translation:  {n_total - n_translated}")
 
-    # Optional lineage column (skip if --full_lineage, output is already a lineage)
-    if args.output_full_lineage and not args.full_lineage:
-        def get_lineage_single(name):
-            if name == NO_TRANS:
-                return ""
-            for prefix, _ in RANK_PREFIXES:
-                result = lineage_dict.get(prefix + name)
-                if result:
-                    return result
-            return ""
-
-        def get_lineage(entry):
-            if entry == NO_TRANS:
-                return ""
-            parts = entry.split(sep)
-            return sep.join(get_lineage_single(p.strip()) for p in parts)
-
-        df[args.out_column_name + "_lineage"] = [
-            get_lineage(t) for t in df[args.out_column_name]
-        ]
-
-    if args.empty_on_fail:
-        df[args.out_column_name] = df[args.out_column_name].replace("no_translation", "")
+    _apply_empty_on_fail(df, args)
 
     df.to_csv(args.out_file, index=False)
     print(f"Output written to {args.out_file}")
 
 
-# -- CLI entry point -------------------------------------------------------
+def _add_output_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared output-shape flags to a subparser.
+
+    The main output column always carries the full GTDB lineage.  The
+    lowest-rank column is the opt-in extra.
+    """
+    parser.add_argument(
+        "--output_lowest_rank",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add an <out_column>_lowest column holding just the most "
+             "specific translated rank, without its rank prefix "
+             "(default: disabled; the main column always holds the full "
+             "lineage)",
+    )
+    parser.add_argument(
+        "--empty_on_fail",
+        action="store_true",
+        help="Output empty string instead of 'no_translation' for failed lookups",
+    )
+
+
+def _add_report_args(parser: argparse.ArgumentParser) -> None:
+    """Add the shared purity-reporting flags to a subparser."""
+    parser.add_argument(
+        "--report_purity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add <out_column>_purity and <out_column>_support columns "
+             "giving the winning share of votes (a fraction in 0-1, "
+             "1.0 = unanimous) and the total vote count behind each "
+             "mapping (default: enabled). Values are empty where no "
+             "votes lie behind the mapping.",
+    )
+
 
 def _add_bundle_args(parser: argparse.ArgumentParser) -> None:
     """Add --bundle, --version, --force to a subparser."""
@@ -296,7 +499,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    # -- build ---------------------------------------------------------
     p_build = subparsers.add_parser(
         "build",
         help="Build a translation bundle from raw GTDB + NCBI files.",
@@ -309,8 +511,34 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_build.add_argument(
         "--names_dmp",
-        required=True,
-        help="Path to NCBI names.dmp",
+        default=None,
+        help="Path to NCBI names.dmp (optional; without it, synonym "
+             "expansion and tax-ID translation are unavailable)",
+    )
+    p_build.add_argument(
+        "--silva_columns",
+        nargs="+",
+        default=None,
+        help="Metadata columns to pool SILVA votes from (default: "
+             "ssu_silva_taxonomy lsu_silva_23s_taxonomy)",
+    )
+    p_build.add_argument(
+        "--no_silva",
+        action="store_true",
+        help="Skip the SILVA dictionary entirely",
+    )
+    p_build.add_argument(
+        "--self_test",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Score the finished bundle against the metadata it was "
+             "built from (default: enabled)",
+    )
+    p_build.add_argument(
+        "--self_test_limit",
+        type=int,
+        default=None,
+        help="Only score this many genomes in the self-test",
     )
     p_build.add_argument(
         "--changelog",
@@ -328,10 +556,9 @@ def main(argv: list[str] | None = None) -> None:
         help="Output bundle path (default: gtdb_translate_<version>.msgpack.zst)",
     )
 
-    # -- ncbi ----------------------------------------------------------
     p_ncbi = subparsers.add_parser(
         "ncbi",
-        help="Batch-translate NCBI/SILVA names or tax IDs to GTDB.",
+        help="Batch-translate NCBI names or tax IDs to GTDB.",
     )
     p_ncbi.add_argument("--in_file", required=True, help="Input CSV or TSV")
     p_ncbi.add_argument("--out_file", required=True, help="Output CSV")
@@ -346,34 +573,28 @@ def main(argv: list[str] | None = None) -> None:
         help="Name for the translated column (default: gtdb_translated)",
     )
     p_ncbi.add_argument(
-        "--sep",
+        "--multi_sep",
         default="|",
-        help="Separator for multiple names per cell (default: |)",
+        help="Separator for multiple independent entries per cell "
+             "(default: |). With --full_lineage, a cell may hold several "
+             "lineages joined by --multi_sep, each internally delimited "
+             "by --lineage_sep.",
     )
     p_ncbi.add_argument(
         "--lineage_sep",
-        default=";",
-        help="Separator within a lineage string (default: ;)",
+        default=None,
+        help="Separator within a lineage string (default: auto-detected, "
+             "usually ';')",
     )
     p_ncbi.add_argument(
         "--full_lineage",
         action=argparse.BooleanOptionalAction,
-        help="Treat entries as full lineages",
-    )
-    p_ncbi.add_argument(
-        "--output_full_lineage",
-        action=argparse.BooleanOptionalAction,
-        help="Add a column with the full GTDB lineage",
+        help="Treat entries as full lineages (default: auto-detected)",
     )
     p_ncbi.add_argument(
         "--from_taxids",
         action=argparse.BooleanOptionalAction,
-        help="Treat entries as NCBI tax IDs",
-    )
-    p_ncbi.add_argument(
-        "--from_silva",
-        action=argparse.BooleanOptionalAction,
-        help="Sanitize input as SILVA lineages (remove sk__, replace _ with space, merge genus into species)",
+        help="Treat entries as NCBI tax IDs (default: auto-detected)",
     )
     p_ncbi.add_argument(
         "--genus_fallback",
@@ -381,14 +602,10 @@ def main(argv: list[str] | None = None) -> None:
         default=False,
         help="Fall back to genus-level when exact species match fails (default: disabled)",
     )
-    p_ncbi.add_argument(
-        "--empty_on_fail",
-        action="store_true",
-        help="Output empty string instead of 'no_translation' for failed lookups",
-    )
+    _add_output_args(p_ncbi)
+    _add_report_args(p_ncbi)
     _add_bundle_args(p_ncbi)
 
-    # -- forward -------------------------------------------------------
     p_fwd = subparsers.add_parser(
         "forward",
         help="Forward-translate old GTDB names to the current release.",
@@ -406,26 +623,77 @@ def main(argv: list[str] | None = None) -> None:
         help="Name for the output column (default: gtdb_forwarded)",
     )
     p_fwd.add_argument(
-        "--sep",
+        "--multi_sep",
         default="|",
-        help="Separator for multiple names per cell (default: |)",
+        help="Separator for multiple independent entries per cell (default: "
+             "|). Always used, including with --full_lineage: a cell can "
+             "hold several lineages joined by --multi_sep, each internally "
+             "using --lineage_sep between ranks.",
+    )
+    p_fwd.add_argument(
+        "--lineage_sep",
+        default=None,
+        help="Separator between ranks within a full-lineage entry "
+             "(default: auto-detected, usually ';'; only used with "
+             "--full_lineage)",
     )
     p_fwd.add_argument(
         "--full_lineage",
         action=argparse.BooleanOptionalAction,
-        help="Treat entries as full GTDB lineages (e.g. d__Bacteria;p__Firmicutes;...)",
+        help="Treat entries as full GTDB lineages, e.g. "
+             "'d__Bacteria;p__Firmicutes;...' or the bare "
+             "'Bacteria;Firmicutes;...' (default: auto-detected)",
     )
-    p_fwd.add_argument(
-        "--output_full_lineage",
-        action=argparse.BooleanOptionalAction,
-        help="Add a column with the full current GTDB lineage",
-    )
-    p_fwd.add_argument(
-        "--empty_on_fail",
-        action="store_true",
-        help="Output empty string instead of 'no_translation' for failed lookups",
-    )
+    _add_output_args(p_fwd)
+    # Forward translation walks a rename graph rather than a vote tally,
+    # so there is no purity to report.
+    p_fwd.set_defaults(report_purity=False)
     _add_bundle_args(p_fwd)
+
+    p_silva = subparsers.add_parser(
+        "silva",
+        help="Batch-translate SILVA taxonomy to GTDB.",
+    )
+    p_silva.add_argument("--in_file", required=True, help="Input CSV or TSV")
+    p_silva.add_argument("--out_file", required=True, help="Output CSV")
+    p_silva.add_argument(
+        "--column_name",
+        default=None,
+        help="Column to translate (auto-detected if omitted)",
+    )
+    p_silva.add_argument(
+        "--out_column_name",
+        default="gtdb_translated",
+        help="Name for the translated column (default: gtdb_translated)",
+    )
+    p_silva.add_argument(
+        "--multi_sep",
+        default=None,
+        help="Separator for multiple independent lineages per cell "
+             "(default: none -- each cell is one lineage)",
+    )
+    p_silva.add_argument(
+        "--lineage_sep",
+        default=None,
+        help="Separator between ranks within a lineage "
+             "(default: auto-detected, usually ';')",
+    )
+    p_silva.add_argument(
+        "--full_lineage",
+        action=argparse.BooleanOptionalAction,
+        help="Treat entries as full SILVA lineages rather than single "
+             "taxon names (default: auto-detected)",
+    )
+    p_silva.add_argument(
+        "--genus_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fall back to binomial/genus lookups when exact matching "
+             "fails (default: disabled)",
+    )
+    _add_output_args(p_silva)
+    _add_report_args(p_silva)
+    _add_bundle_args(p_silva)
 
     args = parser.parse_args(argv)
     if args.command is None:
@@ -436,6 +704,8 @@ def main(argv: list[str] | None = None) -> None:
         _build(args)
     elif args.command == "ncbi":
         _ncbi(args)
+    elif args.command == "silva":
+        _silva(args)
     elif args.command == "forward":
         _forward(args)
 

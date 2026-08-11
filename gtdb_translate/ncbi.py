@@ -1,9 +1,13 @@
-"""Translate NCBI/SILVA taxonomy names and tax IDs to GTDB taxonomy.
+"""Translate NCBI taxonomy names and tax IDs to GTDB taxonomy.
 
 This module provides :class:`NCBITranslator`, which wraps the three
 translation dictionaries built from GTDB metadata and NCBI ``names.dmp``,
 plus an optional :class:`~gtdb_translate.forward.ForwardTranslator` for
 resolving renamed GTDB species across releases.
+
+This module does not handle SILVA taxonomy strings; SILVA-classified
+input needs to be converted to NCBI-style names/lineages separately
+before translation.
 """
 
 from __future__ import annotations
@@ -12,10 +16,16 @@ import csv
 import logging
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from .forward import ForwardTranslator
-from .utils import load_bundle, load_legacy_gzip_json, save_bundle
+from .utils import (
+    detect_column_format,
+    load_bundle,
+    load_legacy_gzip_json,
+    save_bundle,
+    strip_rank_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +36,7 @@ class NCBITranslator:
     The translator holds three dictionaries (built from GTDB metadata TSVs
     and NCBI ``names.dmp``) and an optional :class:`ForwardTranslator`:
 
-    * ``ncbi_name_to_gtdb`` — any NCBI / SILVA name → best GTDB taxon
+    * ``ncbi_name_to_gtdb`` — any NCBI name → best GTDB taxon
       (prefixed, e.g. ``"s__Bacillus subtilis"``).
     * ``ncbi_id_to_scientific`` — NCBI tax-ID (str) → scientific name.
     * ``gtdb_name_to_lineage`` — prefixed GTDB taxon → partial lineage
@@ -46,236 +56,62 @@ class NCBITranslator:
         self.ncbi_id_to_scientific: Dict[str, str] = {}
         self.gtdb_name_to_lineage: Dict[str, str] = {}
         self.forward: Optional[ForwardTranslator] = None
+        # Vote statistics, present only for vote-derived entries.  Synonym
+        # expansions and GTDB-identity mappings are not votes and are
+        # deliberately absent rather than given a fabricated score.
+        self.ncbi_support: Dict[str, list] = {}
+        # Carried through so SILVATranslator can share one loaded bundle.
+        self.silva_name_to_gtdb: Dict[str, Dict[str, str]] = {}
+        self.silva_support: Dict[str, Dict[str, list]] = {}
 
-    # ------------------------------------------------------------------
-    # Building from raw data
-    # ------------------------------------------------------------------
+    def support_for(self, name: Optional[str]) -> Optional[list]:
+        """Return ``[votes, purity]`` for *name*, or ``None``.
+
+        *purity* is the winning share of the vote as a fraction in
+        ``[0, 1]``; 1.0 means the vote was unanimous.
+
+        The statistics always describe the mapping actually stored for
+        *name*.  A ``names.dmp`` synonym is stored with its
+        representative scientific name's target, so it reports that
+        representative's votes and purity -- the evidence genuinely is
+        the representative's.
+
+        ``None`` means no votes lie behind the mapping at all: a GTDB
+        taxon mapping to itself, or a name whose representative was never
+        voted on.
+        """
+        if name is None:
+            return None
+        return self.ncbi_support.get(name)
+
+    @classmethod
     def build(
-        self,
-        metadata_paths: Sequence[Union[str, Path]],
-        names_dmp_path: Union[str, Path],
-        changelog_path: Optional[Union[str, Path]] = None,
+        cls,
+        metadata_paths,
+        names_dmp_path=None,
+        changelog_path=None,
+        version: str = "r226",
+        silva_columns=None,
     ) -> "NCBITranslator":
-        """Build all translation dicts from raw GTDB + NCBI files.
+        """Build a translator from raw GTDB + NCBI files.
 
-        Parameters
-        ----------
-        metadata_paths : sequence of str/Path
-            Paths to GTDB metadata TSVs (e.g.
-            ``["bac120_metadata_r226.tsv", "ar53_metadata_r226.tsv"]``).
-        names_dmp_path : str or Path
-            Path to NCBI ``names.dmp``.
-        changelog_path : str or Path, optional
-            Path to ``gtdb-taxid-changelog.csv``.  If provided, a
-            :class:`ForwardTranslator` is built and included in the bundle.
-
-        Returns
-        -------
-        self
+        Thin wrapper around :func:`gtdb_translate.build.build_bundle`,
+        which does the actual single-pass parsing.  Construction lives
+        there so that this module stays a pure consumer of a finished
+        bundle.
         """
-        import pandas as pd  # deferred — only needed for building
-        import re
+        from .build import SILVA_COLUMNS, build_bundle
 
-        # -- Step 1: NCBI/SILVA name → GTDB name (vote-based) -------------
-        ncbi_votes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        # Separate rank-aligned votes: maps bare NCBI name → {GTDB name → count}
-        # Only from rank-by-rank lineage alignment, not organism names
-        rank_aligned_votes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        gtdb_name_to_lineage: Dict[str, str] = {}
-        # SILVA lineages containing these are organellar (host, not bacterium)
-        _organellar = {"Mitochondria", "Chloroplast"}
-
-        for fpath in metadata_paths:
-            logger.info("Parsing metadata: %s", fpath)
-            df = pd.read_csv(fpath, sep="\t", low_memory=False)
-            for row in df.itertuples(index=False):
-                ncbi_organism_name = getattr(row, "ncbi_organism_name", "")
-                ncbi_lineage = str(getattr(row, "ncbi_taxonomy", "")).split(";")
-                silva_lineage = str(getattr(row, "ssu_silva_taxonomy", "")).split(";")
-                silva_23s_lineage = str(getattr(row, "lsu_silva_23s_taxonomy", "")).split(";")
-                gtdb_lineage = str(getattr(row, "gtdb_taxonomy", "")).split(";")
-                unfiltered_ncbi_last = str(
-                    getattr(row, "ncbi_taxonomy_unfiltered", "")
-                ).split(";")[-1]
-
-                # organism name → species-level GTDB taxon
-                ncbi_votes[ncbi_organism_name][gtdb_lineage[-1]] += 1
-
-                # rank-by-rank alignment
-                for ii, (ncbi_tax, gtdb_tax) in enumerate(
-                    zip(ncbi_lineage, gtdb_lineage)
-                ):
-                    gtdb_name_to_lineage[gtdb_tax] = ";".join(
-                        gtdb_lineage[: ii + 1]
-                    )
-                    # fall back to unfiltered species if filtered is empty
-                    if (
-                        ii == 6
-                        and len(ncbi_tax) == 3
-                        and len(unfiltered_ncbi_last) > 3
-                        and unfiltered_ncbi_last.startswith("s__")
-                    ):
-                        ncbi_tax = unfiltered_ncbi_last
-
-                    if not (len(ncbi_tax) == 3 or len(gtdb_tax) == 3):
-                        bare = ncbi_tax[3:]
-                        ncbi_votes[bare][gtdb_tax] += 1
-                        rank_aligned_votes[bare][gtdb_tax] += 1
-
-                    # SILVA 16S (skip organellar: Mitochondria / Chloroplast)
-                    if len(silva_lineage) == 7 or (
-                        ii + 1 < len(silva_lineage) < 7
-                    ):
-                        if not _organellar.intersection(silva_lineage):
-                            silva_tax = silva_lineage[ii].split("str.")[0].strip()
-                            ncbi_votes[silva_tax][gtdb_tax] += 1
-                    # SILVA 23S fallback
-                    elif len(silva_23s_lineage) == 7 or (
-                        ii + 1 < len(silva_23s_lineage) < 7
-                    ):
-                        if not _organellar.intersection(silva_23s_lineage):
-                            silva_tax = (
-                                silva_23s_lineage[ii].split("str.")[0].strip()
-                            )
-                            ncbi_votes[silva_tax][gtdb_tax] += 1
-
-        # majority vote → single best GTDB name per NCBI name
-        ncbi_name_to_gtdb: Dict[str, str] = {
-            ncbi: max(counter.items(), key=lambda x: x[1])[0]
-            for ncbi, counter in ncbi_votes.items()
-        }
-
-        # Build authoritative rank-aligned mapping (majority vote on
-        # rank-aligned votes only — not polluted by organism names)
-        rank_aligned: Dict[str, str] = {
-            ncbi: max(counter.items(), key=lambda x: x[1])[0]
-            for ncbi, counter in rank_aligned_votes.items()
-        }
-
-        # Post-process: fix genus and "sp." names using rank-aligned data.
-        # For bare genus names and "Genus sp.*" patterns, prefer the
-        # rank-aligned genus→genus mapping over the mixed vote.
-        _sp_pattern = re.compile(r"^(\S+)\s+sp\.?(?:\s|$)")
-        for name in list(ncbi_name_to_gtdb.keys()):
-            # Bare genus name (single word, capitalised)
-            if " " not in name and name[0:1].isupper():
-                if name in rank_aligned:
-                    ncbi_name_to_gtdb[name] = rank_aligned[name]
-            # "Genus sp." / "Genus sp. XYZ" patterns
-            else:
-                m = _sp_pattern.match(name)
-                if m:
-                    genus = m.group(1)
-                    if genus in rank_aligned:
-                        ncbi_name_to_gtdb[name] = rank_aligned[genus]
-
-        # ensure every GTDB name (without prefix) maps to itself
-        for fpath in metadata_paths:
-            df = pd.read_csv(fpath, sep="\t", low_memory=False)
-            for row in df.itertuples(index=False):
-                gtdb_lineage = str(getattr(row, "gtdb_taxonomy", "")).split(";")
-                for gtdb_tax in gtdb_lineage:
-                    bare = gtdb_tax[3:]
-                    if bare not in ncbi_name_to_gtdb:
-                        ncbi_name_to_gtdb[bare] = gtdb_tax
-
-        # -- Step 2: NCBI names.dmp — synonyms & scientific names ----------
-        logger.info("Parsing names.dmp: %s", names_dmp_path)
-        ncbi_name_to_id: Dict[str, int] = {}
-        ncbi_id_to_scientific: Dict[int, str] = {}
-        with open(names_dmp_path) as fh:
-            for line in fh:
-                parts = [x.strip() for x in line.split("|")]
-                if len(parts) < 4:
-                    continue
-                taxid = int(parts[0])
-                name = parts[1].split("(")[0].strip()
-                ncbi_name_to_id[name] = taxid
-                if parts[3] == "scientific name":
-                    ncbi_id_to_scientific[taxid] = name
-
-        # Resolve synonyms through scientific names.
-        # Protect rank-aligned mappings from being overwritten.
-        protected = set(rank_aligned.keys())
-        ncbi_rep_to_gtdb = {}
-        for ncbi_name, gtdb_name in ncbi_name_to_gtdb.items():
-            if ncbi_name in ncbi_name_to_id:
-                rep = ncbi_id_to_scientific.get(ncbi_name_to_id[ncbi_name], ncbi_name)
-            else:
-                rep = ncbi_name
-            # Don't overwrite a rank-aligned mapping with a synonym-derived one
-            if rep not in protected or rep not in ncbi_rep_to_gtdb:
-                ncbi_rep_to_gtdb[rep] = gtdb_name
-
-        expanded: Dict[str, str] = {}
-        for ncbi_name, taxid in ncbi_name_to_id.items():
-            rep = ncbi_id_to_scientific.get(taxid, ncbi_name)
-            expanded[ncbi_name] = ncbi_rep_to_gtdb.get(rep, "none")
-        expanded.update(ncbi_rep_to_gtdb)
-
-        # Store with string keys for serialisation
-        id_to_sci_str = {str(k): v for k, v in ncbi_id_to_scientific.items()}
-
-        self.ncbi_name_to_gtdb = expanded
-        self.ncbi_id_to_scientific = id_to_sci_str
-        self.gtdb_name_to_lineage = gtdb_name_to_lineage
-
-        # -- Step 3 (optional): Forward translator -------------------------
-        if changelog_path is not None:
-            logger.info("Building forward translator from: %s", changelog_path)
-            self.forward = ForwardTranslator()
-            self.forward.build(changelog_path)
-        else:
-            self.forward = None
-
-        return self
-
-    # ------------------------------------------------------------------
-    # Translation — names
-    # ------------------------------------------------------------------
-    @staticmethod
-    def sanitize_lineages(
-        lineages: Iterable[str],
-        lineage_sep: str = ";",
-        check_merge_species: bool = False,
-        replace_symbols: Optional[Dict[str, str]] = None,
-        check_remove_sk: bool = False,
-    ) -> List[str]:
-        """Clean up raw lineage strings before translation.
-
-        Parameters
-        ----------
-        lineages : iterable of str
-            Raw lineage strings.
-        lineage_sep : str
-            Delimiter between ranks (default ``";"``)
-        check_merge_species : bool
-            If the species name does not start with the genus, prepend genus.
-        replace_symbols : dict, optional
-            Characters to replace (e.g. ``{"_": " "}``).
-        check_remove_sk : bool
-            Remove the ``sk__`` (superkingdom) rank if present.
-        """
-        sanitized = []
-        for lineage in lineages:
-            taxa = [t.strip() for t in lineage.split(lineage_sep)]
-            check_species = taxa[-1].startswith("s__")
-            if check_remove_sk and taxa[0].startswith("sk__"):
-                taxa = [taxa[0]] + taxa[2:]
-            taxa = [
-                "__".join(t.split("__")[1:]) if "__" in t else t for t in taxa
-            ]
-            if replace_symbols is not None:
-                for old, new in replace_symbols.items():
-                    taxa = [t.replace(old, new) for t in taxa]
-            if (
-                check_merge_species
-                and check_species
-                and not taxa[-1].startswith(taxa[-2])
-            ):
-                taxa[-1] = f"{taxa[-2]} {taxa[-1]}"
-            sanitized.append(lineage_sep.join(taxa))
-        return sanitized
+        bundle = build_bundle(
+            metadata_paths=metadata_paths,
+            names_dmp_path=names_dmp_path,
+            changelog_path=changelog_path,
+            version=version,
+            silva_columns=(
+                SILVA_COLUMNS if silva_columns is None else silva_columns
+            ),
+        )
+        return cls.from_bundle(bundle)
 
     def translate(
         self,
@@ -283,76 +119,160 @@ class NCBITranslator:
         sep: str = "|",
         full_lineage: bool = False,
         genus_fallback: bool = False,
-    ) -> List[str]:
-        """Translate NCBI/SILVA names to GTDB.
+        multi_sep: Optional[str] = None,
+        with_support: bool = False,
+    ):
+        """Translate NCBI names to GTDB.
 
         Parameters
         ----------
         entries : sequence of str
-            Each entry is one or more taxon names joined by *sep*,
-            or a full lineage string if *full_lineage* is ``True``.
+            Each entry is one or more taxon names joined by *sep*
+            (non-full-lineage mode), or one or more full lineage
+            strings (full-lineage mode; multiple lineages per entry
+            require *multi_sep*).
         sep : str
-            Separator between multiple names within a single entry.
+            Separator between multiple names within a single entry
+            when *full_lineage* is ``False``. When *full_lineage* is
+            ``True``, this is instead the separator between ranks
+            within a single lineage.
         full_lineage : bool
-            If ``True``, treat each entry as a complete lineage and
-            return the best matching GTDB lineage.
+            If ``True``, treat each entry (or, if *multi_sep* is given,
+            each *multi_sep*-separated part of an entry) as a complete
+            lineage and return the best matching GTDB lineage for it.
         genus_fallback : bool
             If ``True``, fall back to binomial and genus-level
             lookups when an exact match fails.  If ``False`` (default),
             only try exact match, bracket removal, and parenthetical
             removal.
+        multi_sep : str, optional
+            Only used when *full_lineage* is ``True``. If given, splits
+            each entry into one or more independent lineages on
+            *multi_sep*, translates them separately, and re-joins the
+            results with *multi_sep* (an entry where every lineage
+            fails becomes a single ``"no_translation"``). If ``None``
+            (default), each entry is treated as a single lineage.
+
+        with_support : bool
+            If ``True``, also return per-entry purity and vote-count
+            columns.  Purity is a fraction in ``[0, 1]``.  Values are
+            empty for entries with no votes behind them (GTDB taxa that
+            map to themselves, and names whose representative was never
+            voted on).
 
         Returns
         -------
-        list of str
-            Translated entries.  ``"no_translation"`` when no mapping
-            was found.
+        list of str, or tuple of three lists
+            Translated entries, or ``(translations, purity, votes)``
+            when *with_support* is set.  ``"no_translation"`` when no
+            mapping was found.
         """
         NO_TRANS = "no_translation"
         translations = [NO_TRANS] * len(entries)
+        purities = [""] * len(entries)
+        supports = [""] * len(entries)
+
+        def _fmt(stats):
+            """Render one entry's support stats as (purity, votes) strings."""
+            if not stats:
+                return "", ""
+            return str(stats[1]), str(stats[0])
+
         for i, entry in enumerate(entries):
             if not isinstance(entry, str):
                 continue
-            taxa = entry.split(sep)[::-1]
-            if full_lineage and not (
-                taxa[-1].endswith("Bacteria") or taxa[-1].endswith("Archaea")
-            ):
-                continue
+
             if full_lineage:
-                for ii, tax in enumerate(taxa):
-                    gtdb_name = self._lookup_name(tax, genus_fallback=genus_fallback)
-                    if gtdb_name in self.gtdb_name_to_lineage:
-                        best = self.gtdb_name_to_lineage[gtdb_name]
-                        if best.count(";") >= len(taxa) - ii:
-                            best = ";".join(
-                                best.split(";")[: len(taxa) - ii]
-                            )
-                        translations[i] = best
-                        break
+                lineages = entry.split(multi_sep) if multi_sep else [entry]
+                results, part_pur, part_vot = [], [], []
+                for lineage in lineages:
+                    lineage = lineage.strip()
+                    if not lineage:
+                        results.append(NO_TRANS)
+                        part_pur.append("")
+                        part_vot.append("")
+                        continue
+                    result, stats = self._translate_single_lineage(
+                        lineage, sep=sep, genus_fallback=genus_fallback
+                    )
+                    results.append(result if result is not None else NO_TRANS)
+                    pur, vot = _fmt(stats)
+                    part_pur.append(pur)
+                    part_vot.append(vot)
+                if all(r == NO_TRANS for r in results):
+                    continue
+                if multi_sep:
+                    translations[i] = multi_sep.join(results)
+                    purities[i] = multi_sep.join(part_pur)
+                    supports[i] = multi_sep.join(part_vot)
+                else:
+                    translations[i] = results[0]
+                    purities[i] = part_pur[0]
+                    supports[i] = part_vot[0]
             else:
-                parts = []
+                taxa = entry.split(sep)[::-1]
+                parts, part_pur, part_vot = [], [], []
                 for tax in taxa:
-                    gtdb_name = self._lookup_name(tax, genus_fallback=genus_fallback)
-                    if gtdb_name is not None and gtdb_name != "none":
-                        parts.append(gtdb_name[3:])
+                    hit = self.lookup_name(tax, genus_fallback=genus_fallback)
+                    if hit is not None and hit[0] != "none":
+                        parts.append(hit[0][3:])
+                        pur, vot = _fmt(self.support_for(hit[1]))
                     else:
                         parts.append(NO_TRANS)
-                # Reverse back to original order
+                        pur, vot = "", ""
+                    part_pur.append(pur)
+                    part_vot.append(vot)
                 parts = parts[::-1]
-                # If every part failed, single "no_translation";
-                # otherwise join (keeping per-part "no_translation" markers)
                 if all(p == NO_TRANS for p in parts):
-                    translations[i] = NO_TRANS
-                else:
-                    translations[i] = sep.join(parts)
+                    continue
+                translations[i] = sep.join(parts)
+                purities[i] = sep.join(part_pur[::-1])
+                supports[i] = sep.join(part_vot[::-1])
+
+        if with_support:
+            return translations, purities, supports
         return translations
+
+    def _translate_single_lineage(
+        self,
+        lineage: str,
+        sep: str,
+        genus_fallback: bool,
+    ) -> Tuple[Optional[str], Optional[list]]:
+        """Translate a single full lineage string.
+
+        Tries the lowest (most specific) rank first and works up toward
+        domain, returning the first GTDB match found. Returns ``None``
+        if no rank in the lineage resolves to a known GTDB taxon.
+
+        The lineage does not need to start at domain -- a phylum-first
+        lineage (e.g. one that's already had its domain/kingdom prefix
+        stripped) is tried at every rank it does contain. Non-prokaryotic
+        input isn't special-cased; it's expected to simply fail to match
+        anything in ``ncbi_name_to_gtdb`` (which is built exclusively
+        from prokaryotic GTDB/NCBI data) and fall through to ``None``.
+        """
+        taxa = lineage.split(sep)[::-1]
+        is_domain_anchored = taxa[-1].endswith("Bacteria") or taxa[-1].endswith("Archaea")
+        for ii, tax in enumerate(taxa):
+            hit = self.lookup_name(tax, genus_fallback=genus_fallback)
+            if hit is None:
+                continue
+            gtdb_name, matched_key = hit
+            if gtdb_name in self.gtdb_name_to_lineage:
+                best = self.gtdb_name_to_lineage[gtdb_name]
+                if is_domain_anchored and best.count(";") >= len(taxa) - ii:
+                    best = ";".join(best.split(";")[: len(taxa) - ii])
+                return best, self.support_for(matched_key)
+        return None, None
 
     def translate_ids(
         self,
         entries: Sequence[str],
         sep: str = "|",
         full_lineage: bool = False,
-    ) -> List[str]:
+        with_support: bool = False,
+    ):
         """Translate NCBI tax IDs to GTDB names.
 
         Parameters
@@ -363,100 +283,132 @@ class NCBITranslator:
             Separator between multiple IDs within a single entry.
         full_lineage : bool
             If ``True``, return full GTDB lineage strings.
+        with_support : bool
+            If ``True``, also return purity and vote-count columns.
 
         Returns
         -------
-        list of str
+        list of str, or tuple of three lists
         """
         NO_TRANS = "no_translation"
         translations = [NO_TRANS] * len(entries)
+        purities = [""] * len(entries)
+        supports = [""] * len(entries)
         for i, taxs in enumerate(entries):
             if not isinstance(taxs, str):
                 continue
-            parts = []
+            parts, part_pur, part_vot = [], [], []
             for taxid in taxs.split(sep):
                 sci = self.ncbi_id_to_scientific.get(taxid.strip())
                 if sci is None:
                     parts.append(NO_TRANS)
+                    part_pur.append("")
+                    part_vot.append("")
                     continue
                 gtdb_name = self.ncbi_name_to_gtdb.get(sci, "none")
                 if gtdb_name == "none":
                     parts.append(NO_TRANS)
+                    part_pur.append("")
+                    part_vot.append("")
                     continue
+                stats = self.support_for(sci)
+                part_pur.append(str(stats[1]) if stats else "")
+                part_vot.append(str(stats[0]) if stats else "")
                 if full_lineage and gtdb_name in self.gtdb_name_to_lineage:
                     gtdb_name = self.gtdb_name_to_lineage[gtdb_name]
+                elif not full_lineage:
+                    gtdb_name = strip_rank_prefix(gtdb_name)
                 parts.append(gtdb_name)
             if all(p == NO_TRANS for p in parts):
                 translations[i] = NO_TRANS
             else:
                 translations[i] = sep.join(parts)
+                purities[i] = sep.join(part_pur)
+                supports[i] = sep.join(part_vot)
+
+        if with_support:
+            return translations, purities, supports
         return translations
 
-    def _lookup_name(self, name: str, genus_fallback: bool = False) -> Optional[str]:
+    def lookup_name(
+        self, name: str, genus_fallback: bool = False
+    ) -> Optional[Tuple[str, str]]:
         """Look up a single NCBI name with progressive fallbacks.
 
         Tries, in order:
 
         0. Strip bare ``sp.``/``sp``/``spp.``/``spp`` suffix
-           (``Pseudomonas sp.`` → ``Pseudomonas``)
+           (``Pseudomonas sp.`` -> ``Pseudomonas``)
         1. Exact match
-        2. Bracket removal  (``[Clostridium]`` → ``Clostridium``)
+        2. Bracket removal  (``[Clostridium]`` -> ``Clostridium``)
         3. Parenthetical removal  (``Klebsiella pneumoniae (resistant)``
-           → ``Klebsiella pneumoniae``)
+           -> ``Klebsiella pneumoniae``)
+        4. Replace the first ``_`` with a space (``Escherichia_coli``
+           -> ``Escherichia coli``). Simple and doesn't catch every
+           underscore-joined format, but exact match on the untouched
+           name is always tried first, so this doesn't affect names
+           that already match as given.
 
         If *genus_fallback* is ``True``, also tries:
 
-        4. Binomial (first two words)  — strips strain IDs like
+        5. Binomial (first two words) -- strips strain IDs like
            ``Acinetobacter baumannii AB03``
-           → ``Acinetobacter baumannii``
+           -> ``Acinetobacter baumannii``
            Skipped when the second word is ``sp.``, ``sp``, ``spp.``,
            or ``spp`` (these are genus-level, not true binomials).
-        5. Genus only  (``Bombilactobacillus sp.``
-           → ``Bombilactobacillus``)
+        6. Genus only  (``Bombilactobacillus sp.``
+           -> ``Bombilactobacillus``)
 
         At each step, ``"none"`` values in the dictionary are treated as
         misses so that the fallback chain continues.
+
+        Returns
+        -------
+        tuple of (str, str), or None
+            ``(prefixed GTDB taxon, matched dictionary key)``.  The key
+            is returned so callers can retrieve the vote statistics
+            behind the hit via :meth:`support_for`.
         """
         import re
 
-        def _get(key: str) -> Optional[str]:
-            """Return dict value if it exists and isn't 'none'."""
+        def _get(key: str) -> Optional[Tuple[str, str]]:
+            """Return (value, key) if the key exists and isn't 'none'."""
             val = self.ncbi_name_to_gtdb.get(key)
             if val is not None and val != "none":
-                return val
+                return val, key
             return None
 
-        # 0. Strip bare "sp."/"spp." suffix → treat as genus
+        name = strip_rank_prefix(name.strip())
         name = re.sub(r"\s+spp?\.?$", "", name.strip())
 
-        # 1. Exact
         result = _get(name)
         if result is not None:
             return result
 
-        # 2. Bracket removal
         if "[" in name:
             cleaned = name.replace("[", "").replace("]", "")
             result = _get(cleaned)
             if result is not None:
                 return result
-            # Continue with cleaned version for further fallbacks
             name = cleaned
 
-        # 3. Parenthetical removal — remove (...) content, keep the rest
         if "(" in name:
             stripped = re.sub(r"\([^)]*\)", "", name).strip()
-            stripped = re.sub(r"\s+", " ", stripped)  # collapse whitespace
+            stripped = re.sub(r"\s+", " ", stripped)
             result = _get(stripped)
             if result is not None:
                 return result
             name = stripped
 
+        if "_" in name:
+            name = name.replace("_", " ", 1)
+            result = _get(name)
+            if result is not None:
+                return result
+
         if not genus_fallback:
             return None
 
-        # 4. Binomial (first two words) — catches strain suffixes
-        #    Skip if second word is sp./spp. — that's genus-level, not a binomial
         _SP_WORDS = {"sp.", "sp", "spp.", "spp"}
         words = name.split()
         if len(words) > 2 and words[1] not in _SP_WORDS:
@@ -465,35 +417,30 @@ class NCBITranslator:
             if result is not None:
                 return result
 
-        # 5. Genus only — catches "Genus sp." and bare genus names
         if len(words) >= 1:
-            genus = words[0]
-            result = _get(genus)
+            result = _get(words[0])
             if result is not None:
                 return result
 
         return None
 
-    # ------------------------------------------------------------------
-    # Persistence — bundle format
-    # ------------------------------------------------------------------
-    def save(self, path: Union[str, Path]) -> None:
-        """Save all translation dicts as a single ``.msgpack.zst`` bundle.
+    def _lookup_name(
+        self, name: str, genus_fallback: bool = False
+    ) -> Optional[str]:
+        """Return only the GTDB taxon from :meth:`lookup_name`."""
+        result = self.lookup_name(name, genus_fallback=genus_fallback)
+        return result[0] if result else None
 
-        The bundle contains:
-
-        * ``ncbi_name_to_gtdb``
-        * ``ncbi_id_to_scientific``
-        * ``gtdb_name_to_lineage``
-        * ``forward_trans_dict`` (if a forward translator is attached)
-        * ``forward_rank_dicts`` (per-rank forward translations)
-        * ``version``
-        """
-        data = {
+    def to_bundle(self) -> dict:
+        """Return this translator's contents as a bundle dict."""
+        return {
             "version": self.version,
             "ncbi_name_to_gtdb": self.ncbi_name_to_gtdb,
+            "ncbi_name_to_gtdb_support": self.ncbi_support,
             "ncbi_id_to_scientific": self.ncbi_id_to_scientific,
             "gtdb_name_to_lineage": self.gtdb_name_to_lineage,
+            "silva_name_to_gtdb": self.silva_name_to_gtdb,
+            "silva_name_to_gtdb_support": self.silva_support,
             "forward_trans_dict": (
                 self.forward.translation_dict if self.forward else {}
             ),
@@ -501,34 +448,18 @@ class NCBITranslator:
                 self.forward.rank_translation_dicts if self.forward else {}
             ),
         }
-        save_bundle(data, path)
 
     @classmethod
-    def load(cls, path: Union[str, Path]) -> "NCBITranslator":
-        """Load a translator from a ``.msgpack.zst`` bundle.
-
-        Also supports the legacy ``translation_dicts_rXXX.json.gz``
-        format (forward translator will not be available in that case).
-        """
-        path = Path(path)
-
-        # Legacy format detection
-        if path.suffixes[-2:] == [".json", ".gz"] or path.suffix == ".gz":
-            dicts = load_legacy_gzip_json(path)
-            obj = cls()
-            obj.ncbi_name_to_gtdb = dicts[0]
-            # Legacy stored int keys; normalise to str
-            obj.ncbi_id_to_scientific = {
-                str(k): v for k, v in dicts[1].items()
-            }
-            obj.gtdb_name_to_lineage = dicts[2]
-            return obj
-
-        data = load_bundle(path)
+    def from_bundle(cls, data: dict) -> "NCBITranslator":
+        """Construct a translator from an in-memory bundle dict."""
         obj = cls(version=data.get("version", "unknown"))
         obj.ncbi_name_to_gtdb = data["ncbi_name_to_gtdb"]
+        obj.ncbi_support = data.get("ncbi_name_to_gtdb_support", {})
         obj.ncbi_id_to_scientific = data["ncbi_id_to_scientific"]
         obj.gtdb_name_to_lineage = data["gtdb_name_to_lineage"]
+        obj.silva_name_to_gtdb = data.get("silva_name_to_gtdb", {})
+        obj.silva_support = data.get("silva_name_to_gtdb_support", {})
+
         fwd_dict = data.get("forward_trans_dict", {})
         fwd_rank_dicts = data.get("forward_rank_dicts", {})
         if fwd_dict or fwd_rank_dicts:
@@ -537,9 +468,40 @@ class NCBITranslator:
             obj.forward._rank_trans_dicts = fwd_rank_dicts
         return obj
 
-    # ------------------------------------------------------------------
-    # Convenience — auto-download
-    # ------------------------------------------------------------------
+    def save(self, path: Union[str, Path]) -> None:
+        """Save all dictionaries as a single ``.msgpack.zst`` bundle.
+
+        The bundle contains:
+
+        * ``ncbi_name_to_gtdb`` and ``ncbi_name_to_gtdb_support``
+        * ``ncbi_id_to_scientific``
+        * ``gtdb_name_to_lineage``
+        * ``silva_name_to_gtdb`` and ``silva_name_to_gtdb_support``
+        * ``forward_trans_dict`` / ``forward_rank_dicts``
+        * ``version``
+        """
+        save_bundle(self.to_bundle(), path)
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "NCBITranslator":
+        """Load a translator from a ``.msgpack.zst`` bundle.
+
+        Also supports the legacy ``translation_dicts_rXXX.json.gz``
+        format, which carries neither support statistics nor a forward
+        or SILVA dictionary.
+        """
+        path = Path(path)
+
+        if path.suffixes[-2:] == [".json", ".gz"] or path.suffix == ".gz":
+            dicts = load_legacy_gzip_json(path)
+            obj = cls()
+            obj.ncbi_name_to_gtdb = dicts[0]
+            obj.ncbi_id_to_scientific = {str(k): v for k, v in dicts[1].items()}
+            obj.gtdb_name_to_lineage = dicts[2]
+            return obj
+
+        return cls.from_bundle(load_bundle(path))
+
     @classmethod
     def default(
         cls,
@@ -574,9 +536,6 @@ class NCBITranslator:
         )
         return cls.load(bundle_path)
 
-    # ------------------------------------------------------------------
-    # Column auto-detection (scaffold)
-    # ------------------------------------------------------------------
     def detect_column(
         self,
         df,
@@ -630,9 +589,32 @@ class NCBITranslator:
             )
         return best_col
 
-    # ------------------------------------------------------------------
-    # Dunder
-    # ------------------------------------------------------------------
+    def detect_format(
+        self,
+        df,
+        column: str,
+        sample_rows: int = 100,
+    ) -> Dict[str, object]:
+        """Infer separator / prefix / lineage conventions for *column*.
+
+        Thin wrapper around :func:`gtdb_translate.utils.detect_column_format`
+        that samples *column* from *df*. See that function for the meaning
+        of the returned dict.
+
+        Parameters
+        ----------
+        df : pandas DataFrame
+            Input table.
+        column : str
+            Name of the column to inspect.
+        sample_rows : int
+            Number of rows to sample.
+        """
+        values = df[column].dropna().astype(str).tolist()[:sample_rows]
+        detected = detect_column_format(values, sample_size=sample_rows)
+        logger.info("Auto-detected format for '%s': %s", column, detected)
+        return detected
+
     def __len__(self) -> int:
         return len(self.ncbi_name_to_gtdb)
 

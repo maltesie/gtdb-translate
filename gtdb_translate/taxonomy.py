@@ -33,9 +33,6 @@ class GTDBTaxonomy:
     species_list: List[str] = field(default_factory=list)
     species_to_index: Dict[str, int] = field(default_factory=dict)
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
     @classmethod
     def from_tsv(cls, path: Union[str, Path]) -> "GTDBTaxonomy":
         """Load a GTDB taxonomy TSV (e.g. ``bac120_taxonomy_r226.tsv``).
@@ -60,9 +57,6 @@ class GTDBTaxonomy:
                 taxonomy.species_list.append(species)
         return taxonomy
 
-    # ------------------------------------------------------------------
-    # Queries
-    # ------------------------------------------------------------------
     def __contains__(self, species: str) -> bool:
         return species in self.species_to_lineage
 

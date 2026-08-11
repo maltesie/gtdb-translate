@@ -27,14 +27,23 @@ Quick start
     # Forward-translate a renamed GTDB species (if changelog was included)
     if t.forward:
         t.forward.translate("Lactobacillus oldname")
+
+    # Translate SILVA lineages, sharing the same loaded bundle
+    from gtdb_translate import SILVATranslator
+
+    s = SILVATranslator.from_ncbi(t)
+    s.translate(["Bacteria;Bacillota;Clostridia;Lachnospirales;"
+                 "Lachnospiraceae;Lachnospiraceae NK4A136 group"])
 """
 
 from .forward import ForwardTranslator
 from .ncbi import NCBITranslator
+from .silva import SILVATranslator
 from .taxonomy import GTDBTaxonomy
 
 __all__ = [
     "GTDBTaxonomy",
     "ForwardTranslator",
     "NCBITranslator",
+    "SILVATranslator",
 ]

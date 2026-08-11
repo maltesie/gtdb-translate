@@ -17,12 +17,17 @@ from typing import Dict, Iterable, Optional, Set, Union
 import networkx as nx
 
 from .taxonomy import GTDBTaxonomy
-from .utils import load_json, save_json
+from .utils import (
+    RANK_ORDER,
+    RANK_PREFIXES,
+    RANK_TO_PREFIX,
+    load_json,
+    save_json,
+    split_rank_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
-# Lineage positions:  0=domain 1=phylum 2=class 3=order 4=family 5=genus
-#                     6=species 7=genome_accession (for "no rank" entries)
 RANK_POSITIONS = {
     0: "domain",
     1: "phylum",
@@ -36,19 +41,11 @@ RANK_POSITIONS = {
 class ForwardTranslator:
     """Translate outdated GTDB names to their current equivalents.
 
-    The translator is built in two steps:
-
-    1. :meth:`build` — parse the gtdb-taxdump changelog CSV and construct an
-       internal translation DAG for species, plus rank-level translation
-       dicts for higher ranks.
-    2. :meth:`translate` / :meth:`translate_many` — look up one or more
-       species names.
-    3. :meth:`translate_rank` — look up a name at a specific higher rank
-       (e.g. an outdated genus or phylum name).  Once the current name
-       is obtained, look up its full lineage from the taxonomy.
-
-    The resulting translation dictionaries can be persisted with :meth:`save`
-    and later restored with :meth:`load`.
+    Build with :meth:`build` (parses the gtdb-taxdump changelog into a
+    species-level DAG plus per-rank translation dicts), then look up
+    names with :meth:`translate` / :meth:`translate_many` (species) or
+    :meth:`translate_rank` (higher ranks). Persist with :meth:`save` /
+    :meth:`load`.
 
     Parameters
     ----------
@@ -63,9 +60,6 @@ class ForwardTranslator:
         self._trans_dict: Dict[str, str] = {}
         self._rank_trans_dicts: Dict[str, Dict[str, str]] = {}
 
-    # ------------------------------------------------------------------
-    # Building the DAG + rank votes
-    # ------------------------------------------------------------------
     def build(self, changelog_path: Union[str, Path]) -> "ForwardTranslator":
         """Parse the gtdb-taxdump changelog and build translation dicts.
 
@@ -92,7 +86,6 @@ class ForwardTranslator:
         species_set: Set[str] = set()
         prev_lineage: list[str] = []
 
-        # {rank_name: {old_name: {new_name: count}}}
         rank_votes: Dict[str, Dict[str, Dict[str, int]]] = {
             name: defaultdict(lambda: defaultdict(int))
             for name in RANK_POSITIONS.values()
@@ -111,7 +104,6 @@ class ForwardTranslator:
                 parts = lineage.split(";")
 
                 if taxid != current_taxid:
-                    # Flush the species DAG chain for the previous taxid
                     self._commit_chain(dag, chain)
                     chain = []
                     species_set = set()
@@ -121,10 +113,6 @@ class ForwardTranslator:
                 if len(parts) < 2:
                     continue
 
-                # -- Rank-level votes (BEFORE species dedup) ---------------
-                # Compare every position of the lineage to the previous
-                # entry for this genome. This captures higher-rank renames
-                # even when the species name didn't change.
                 if (
                     change in ("NEW", "CHANGE_LIN_TAX")
                     and len(prev_lineage) >= 7
@@ -142,8 +130,7 @@ class ForwardTranslator:
                 else:
                     prev_lineage = parts
 
-                # -- Species DAG (existing logic) --------------------------
-                species = parts[-2]  # second-to-last = species
+                species = parts[-2]
 
                 if species in species_set:
                     continue
@@ -157,7 +144,6 @@ class ForwardTranslator:
                 elif change == "DELETE":
                     chain = []
 
-            # Flush last chain
             self._commit_chain(dag, chain)
 
         self._dag = dag
@@ -172,9 +158,6 @@ class ForwardTranslator:
         )
         return self
 
-    # ------------------------------------------------------------------
-    # Internal DAG helpers
-    # ------------------------------------------------------------------
     @staticmethod
     def _commit_chain(dag: nx.DiGraph, chain: list[str]) -> None:
         """Add a chain of version|species nodes to the DAG."""
@@ -217,15 +200,12 @@ class ForwardTranslator:
             species_trans = translation.split("|")[1]
             if species_trans == species:
                 continue
-            # Only keep translations that look like valid binomial names
             if " " not in species or " " not in species_trans:
                 continue
-            # If a taxonomy is available, only keep translations that land in it
             if self.taxonomy is not None and species_trans not in self.taxonomy:
                 continue
             raw[species] = species_trans
 
-        # Resolve transitive chains  (A→B, B→C  ⇒  A→C)
         resolved: Dict[str, str] = {}
         for src, dst in raw.items():
             seen = {src}
@@ -250,7 +230,6 @@ class ForwardTranslator:
         result: Dict[str, Dict[str, str]] = {}
         taxonomy_values: Dict[str, Set[str]] = {}
 
-        # Pre-collect taxonomy values per rank for filtering
         if self.taxonomy is not None:
             for rank_name in RANK_POSITIONS.values():
                 taxonomy_values[rank_name] = self.taxonomy.unique_values(
@@ -261,14 +240,12 @@ class ForwardTranslator:
             if not votes:
                 continue
 
-            # Majority vote
             raw: Dict[str, str] = {}
             for old_name, targets in votes.items():
                 best = max(targets.items(), key=lambda x: x[1])
                 new_name = best[0]
                 if new_name == old_name:
                     continue
-                # Filter against taxonomy if available
                 if (
                     self.taxonomy is not None
                     and rank_name in taxonomy_values
@@ -277,14 +254,12 @@ class ForwardTranslator:
                     continue
                 raw[old_name] = new_name
 
-            # Resolve transitive chains
             resolved: Dict[str, str] = {}
             for src, dst in raw.items():
                 seen = {src}
                 while dst in raw and dst not in seen:
                     seen.add(dst)
                     dst = raw[dst]
-                # Drop identity mappings (e.g. A→B→A resolved to A→A)
                 if src != dst:
                     resolved[src] = dst
 
@@ -296,12 +271,19 @@ class ForwardTranslator:
 
         return result
 
-    # ------------------------------------------------------------------
-    # Translation interface
-    # ------------------------------------------------------------------
     def translate(self, species: str) -> str:
-        """Return the current name for *species*, or *species* itself."""
-        return self._trans_dict.get(species, species)
+        """Return the current name for *species*, or *species* itself.
+
+        Accepts either a bare species name (``"Escherichia coli"``) or a
+        rank-prefixed one (``"s__Escherichia coli"``) — the lookup is
+        always done on the bare name, and if the input was prefixed the
+        same prefix is restored on the output.
+        """
+        prefix, bare = split_rank_prefix(species)
+        mapped = self._trans_dict.get(bare)
+        if mapped is None:
+            return species
+        return f"{prefix}__{mapped}" if prefix else mapped
 
     def translate_many(self, species_names: Iterable[str]) -> list[str]:
         """Translate a list of species names."""
@@ -327,8 +309,12 @@ class ForwardTranslator:
         str
             The current name, or *name* itself if no mapping exists.
         """
+        prefix, bare = split_rank_prefix(name)
         rank_dict = self._rank_trans_dicts.get(rank, {})
-        return rank_dict.get(name, name)
+        mapped = rank_dict.get(bare)
+        if mapped is None:
+            return name
+        return f"{prefix}__{mapped}" if prefix else mapped
 
     def translate_lineage(
         self,
@@ -340,9 +326,18 @@ class ForwardTranslator:
 
         Works bottom-up from the lowest rank: if a taxon exists in the
         current GTDB lineage dict, its stored lineage is returned
-        directly (capturing any higher-rank renames).  If the lowest
+        directly (capturing any higher-rank renames). If the lowest
         rank is not found, it is forward-mapped first, then looked up
-        again.  Falls back to progressively higher ranks.
+        again. Falls back to progressively higher ranks.
+
+        Accepts lineages whose ranks are either explicitly prefixed
+        (``"d__Bacteria;p__Firmicutes;...;s__Escherichia coli"``) or bare
+        (``"Bacteria;Firmicutes;...;Escherichia coli"``). Bare lineages
+        are assumed to be given in standard domain-to-species order,
+        anchored at domain (so a partial bare lineage is assumed to be
+        missing its *lowest* ranks, e.g. a 5-token bare lineage is
+        domain through family). A lineage may also mix prefixed and bare
+        tokens.
 
         Every returned lineage is guaranteed to come from
         *gtdb_name_to_lineage* and therefore be in the current GTDB.
@@ -350,8 +345,7 @@ class ForwardTranslator:
         Parameters
         ----------
         lineage : str
-            A GTDB lineage like
-            ``"d__Bacteria;p__Firmicutes;c__Bacilli;..."``.
+            A GTDB lineage, prefixed or bare (see above).
         gtdb_name_to_lineage : dict
             Maps prefixed GTDB names (e.g. ``"s__Escherichia coli"``)
             to their full current lineage string.
@@ -364,43 +358,35 @@ class ForwardTranslator:
             The current lineage from the dict, or ``None`` if nothing
             could be resolved.
         """
-        prefix_to_rank = {
-            "s": "species",
-            "g": "genus",
-            "f": "family",
-            "o": "order",
-            "c": "class",
-            "p": "phylum",
-            "d": "domain",
-        }
+        raw_parts = [p.strip() for p in lineage.split(sep) if p.strip()]
+        n = len(raw_parts)
+        positional_ranks = RANK_ORDER[:n] if n <= len(RANK_ORDER) else [None] * n
 
-        parts = lineage.split(sep)
-
-        # Walk from lowest to highest rank
-        for part in reversed(parts):
-            if len(part) < 4 or part[1:3] != "__":
+        resolved = []
+        for idx, part in enumerate(raw_parts):
+            letter, bare = split_rank_prefix(part)
+            if letter is not None:
+                rank = RANK_PREFIXES.get(letter)
+            else:
+                rank = positional_ranks[idx]
+                letter = RANK_TO_PREFIX.get(rank)
+            if not bare or rank is None or letter is None:
                 continue
-            prefix = part[0]
-            name = part[3:]
-            if not name:
-                continue
-            rank = prefix_to_rank.get(prefix)
-            prefixed = f"{prefix}__{name}"
+            resolved.append((letter, rank, bare))
 
-            # 1. Check if this taxon is in the current GTDB
+        for letter, rank, name in reversed(resolved):
+            prefixed = f"{letter}__{name}"
+
             if prefixed in gtdb_name_to_lineage:
                 return gtdb_name_to_lineage[prefixed]
 
-            # 2. Try forward mapping, then look up the result
             if rank == "species":
                 mapped = self.translate(name)
-            elif rank:
-                mapped = self.translate_rank(name, rank)
             else:
-                continue
+                mapped = self.translate_rank(name, rank)
 
             if mapped != name:
-                mapped_prefixed = f"{prefix}__{mapped}"
+                mapped_prefixed = f"{letter}__{mapped}"
                 if mapped_prefixed in gtdb_name_to_lineage:
                     return gtdb_name_to_lineage[mapped_prefixed]
 
@@ -433,9 +419,6 @@ class ForwardTranslator:
             f"{rank_info})"
         )
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
     def save(self, path: Union[str, Path]) -> None:
         """Save translation dictionaries to a JSON file.
 
@@ -469,11 +452,9 @@ class ForwardTranslator:
         obj = cls(taxonomy=taxonomy)
         raw = load_json(path)
 
-        # New format: {"species": {...}, "ranks": {...}}
         if isinstance(raw, dict) and "species" in raw:
             obj._trans_dict = raw["species"]
             obj._rank_trans_dicts = raw.get("ranks", {})
-        # Old format: flat species dict
         else:
             obj._trans_dict = raw
             obj._rank_trans_dicts = {}
