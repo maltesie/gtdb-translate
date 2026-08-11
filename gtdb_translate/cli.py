@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -301,6 +302,62 @@ def _silva(args: argparse.Namespace) -> None:
     print(f"Output written to {args.out_file}")
 
 
+def _detect_forward_column(translator, df, sample_rows=100):
+    """Pick the column most likely to hold GTDB names to forward-translate.
+
+    Scores each string column by the share of sampled values containing at
+    least one name the forward step could act on: a name already in the
+    current GTDB, or one the forward translator knows how to update.
+    Matching against both is what separates this from
+    :meth:`NCBITranslator.detect_column` -- an outdated GTDB name is
+    absent from the NCBI dictionary, so scoring on that alone would rank
+    the most relevant column lowest.
+
+    Values are tokenised on both the multi-value and the rank separator,
+    so full-lineage columns score on their individual ranks.
+    """
+    import pandas as pd
+
+    from .utils import split_rank_prefix
+
+    fwd = translator.forward
+    known = set(fwd.translation_dict)
+    for rank_map in fwd.rank_translation_dicts.values():
+        known.update(rank_map)
+
+    lineage_dict = translator.gtdb_name_to_lineage
+
+    def _recognised(token):
+        _, bare = split_rank_prefix(token.strip())
+        if not bare:
+            return False
+        if bare in known:
+            return True
+        return any(prefix + bare in lineage_dict for prefix in _RANK_PREFIXES)
+
+    best_col, best_score = None, 0.0
+    sample = df.head(sample_rows)
+    for col in sample.columns:
+        if not pd.api.types.is_string_dtype(sample[col]):
+            continue
+        hits = total = 0
+        for value in sample[col].dropna():
+            total += 1
+            tokens = re.split(r"[|;,]", str(value))
+            if any(_recognised(t) for t in tokens):
+                hits += 1
+        score = hits / total if total else 0.0
+        if score > best_score:
+            best_col, best_score = col, score
+
+    if best_col is not None:
+        print(
+            f"Auto-detected column: '{best_col}' "
+            f"({best_score:.0%} coverage)"
+        )
+    return best_col
+
+
 def _forward(args: argparse.Namespace) -> None:
     import pandas as pd
 
@@ -319,7 +376,16 @@ def _forward(args: argparse.Namespace) -> None:
     df = _read_table(args.in_file)
     column_name = args.column_name
 
-    if column_name not in df.columns:
+    if column_name is None:
+        column_name = _detect_forward_column(translator, df)
+        if column_name is None:
+            print(
+                "ERROR: Could not auto-detect the column to translate. "
+                "Use --column_name to specify it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif column_name not in df.columns:
         print(
             f"ERROR: Column '{column_name}' not found in {args.in_file}. "
             f"Available: {', '.join(df.columns)}",
@@ -614,8 +680,9 @@ def main(argv: list[str] | None = None) -> None:
     p_fwd.add_argument("--out_file", required=True, help="Output CSV")
     p_fwd.add_argument(
         "--column_name",
-        required=True,
-        help="Column containing old GTDB names to forward-translate",
+        default=None,
+        help="Column containing old GTDB names to forward-translate "
+             "(auto-detected if omitted)",
     )
     p_fwd.add_argument(
         "--out_column_name",
