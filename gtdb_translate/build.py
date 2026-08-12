@@ -32,7 +32,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from .utils import RANK_ORDER, resolve_votes
+from .utils import PLACEHOLDER_TOKENS, RANK_ORDER, resolve_votes
 
 logger = logging.getLogger(__name__)
 
@@ -62,17 +62,11 @@ _MISSING = {"", "none", "n/a", "na", "null"}
 #: genomes and must not contribute votes.
 _PROKARYOTIC_DOMAINS = {"Bacteria", "Archaea"}
 
-#: SILVA tokens that carry no taxonomic information.  Skipped when
-#: building votes and rejected at lookup time (see
-#: :data:`gtdb_translate.silva.REJECT_TOKENS`, which is a superset).
-_UNINFORMATIVE_TOKENS = {
-    "incertae sedis",
-    "unknown family",
-    "uncultured",
-    "unidentified",
-    "metagenome",
-    "ambiguous_taxa",
-}
+#: Pipeline placeholders are skipped when building votes.  Vague-looking
+#: but genuine labels (``uncultured``, ``Incertae Sedis``) are kept: they
+#: resolve at very low purity, which the lookup-time threshold handles
+#: better than dropping them here would.
+_UNINFORMATIVE_TOKENS = PLACEHOLDER_TOKENS
 
 #: SILVA ranks that are voted on.  Index 6 of a SILVA path is the
 #: reference sequence's *organism name* (often strain-level, e.g.

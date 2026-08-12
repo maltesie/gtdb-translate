@@ -37,39 +37,39 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 from .ncbi import NCBITranslator
-from .utils import RANK_ORDER, RANK_PREFIXES, RANK_TO_PREFIX, split_rank_prefix
+from .utils import (
+    PLACEHOLDER_TOKENS,
+    RANK_ORDER,
+    RANK_PREFIXES,
+    RANK_TO_PREFIX,
+    split_rank_prefix,
+)
 
 logger = logging.getLogger(__name__)
 
 NO_TRANSLATION = "no_translation"
 
-#: Tokens that must never resolve to anything.
+#: Tokens that must never resolve to anything, beyond the shared
+#: placeholders in :mod:`gtdb_translate.utils`.
 #:
-#: ``Chloroplast`` and ``Mitochondria`` matter most: SILVA places them
-#: inside Cyanobacteriota and Rickettsiales respectively, so without this
-#: guard an organellar read would translate to a plausible-looking
-#: bacterial lineage -- a wrong answer is worse than no answer.
-#:
-#: ``Incertae Sedis`` is rejected because it names a placement problem
-#: rather than a taxon, and appears at several ranks with no shared
-#: meaning.
-REJECT_TOKENS = frozenset(
-    {
-        "",
-        "ambiguous_taxa",
-        "chloroplast",
-        "incertae sedis",
-        "metagenome",
-        "mitochondria",
-        "uncultured",
-        "uncultured bacterium",
-        "uncultured archaeon",
-        "uncultured organism",
-        "unidentified",
-        "unknown family",
-        "wrong",
-    }
-)
+#: Deliberately short. Vague-looking SILVA labels such as ``uncultured``
+#: or ``Incertae Sedis`` are *not* listed: they resolve with very low
+#: purity (``Incertae Sedis`` votes scatter across 183 GTDB genera), so
+#: the purity threshold rejects them while still letting through the
+#: minority that carry real, unanimous evidence. A name list cannot make
+#: that distinction.
+REJECT_TOKENS = frozenset({"wrong"})
+
+_REJECT_PREFIXES = ("unclassified ",)
+
+
+def _is_rejected(token: str) -> bool:
+    """Return ``True`` if *token* carries no usable taxonomic information."""
+    low = token.strip().lower()
+    if low in PLACEHOLDER_TOKENS or low in REJECT_TOKENS:
+        return True
+    return low.startswith(_REJECT_PREFIXES)
+
 
 #: Organellar clades.  SILVA nests these inside real bacterial lineages,
 #: so they are rejected at whole-lineage level (see
@@ -78,17 +78,6 @@ _ORGANELLAR = frozenset({"chloroplast", "mitochondria"})
 
 #: Domains SILVA uses that have no GTDB counterpart.
 _NON_PROKARYOTIC_DOMAINS = frozenset({"eukaryota", "unclassified"})
-
-_REJECT_PREFIXES = ("uncultured ", "unknown ", "unclassified ")
-
-
-def _is_rejected(token: str) -> bool:
-    """Return ``True`` if *token* carries no usable taxonomic information."""
-    low = token.strip().lower()
-    if low in REJECT_TOKENS:
-        return True
-    return low.startswith(_REJECT_PREFIXES)
-
 
 def _split_composite(token: str) -> List[str]:
     """Split a SILVA composite genus into its components.
@@ -106,6 +95,21 @@ def _split_composite(token: str) -> List[str]:
     if all(p[:1].isupper() and p.isalpha() for p in parts):
         return parts
     return []
+
+
+def _is_epithet(token: str) -> bool:
+    """Whether *token* looks like a bare species epithet.
+
+    DADA2's ``addSpecies`` writes the epithet alone (``subtilis``), while
+    SILVA writes a full binomial (``Bacillus subtilis``). The test is
+    "single word, lowercase initial": a binomial always has at least two
+    words and starts uppercase. Comparing against the genus token would
+    not work -- 37% of real SILVA species tokens do not start with their
+    genus (``Escherichia-Shigella`` / ``Shigella sonnei``), and those are
+    genuine binomials.
+    """
+    token = token.strip()
+    return bool(token) and " " not in token and token[:1].islower()
 
 
 class SILVATranslator:
@@ -183,6 +187,7 @@ class SILVATranslator:
         token: str,
         rank: Optional[str] = None,
         genus_fallback: bool = False,
+        min_purity: float = 0.0,
     ) -> Optional[Tuple[str, Optional[list]]]:
         """Resolve one SILVA token to a prefixed GTDB taxon.
 
@@ -211,6 +216,8 @@ class SILVATranslator:
             SILVA dictionary are tried, deepest first.
         genus_fallback : bool
             Enable the NCBI binomial/genus fallback as a last resort.
+        min_purity : float
+            Reject vote-derived mappings below this purity fraction.
 
         Returns
         -------
@@ -226,24 +233,37 @@ class SILVATranslator:
         if _is_rejected(bare):
             return None
 
-        hit = self._lookup_silva(bare, rank)
+        def _pure(hit):
+            """Drop a hit whose vote purity falls below the threshold.
+
+            Mappings with no support pass: they are not vote-derived, so
+            there is nothing to be impure about.
+            """
+            if hit is None:
+                return None
+            _, support = hit
+            if support is not None and min_purity > 0 and support[1] < min_purity:
+                return None
+            return hit
+
+        hit = _pure(self._lookup_silva(bare, rank))
         if hit is not None:
             return hit
 
-        hit = self._lookup_ncbi(bare, genus_fallback=False)
+        hit = _pure(self._lookup_ncbi(bare, genus_fallback=False))
         if hit is not None:
             return hit
 
         for part in _split_composite(bare):
-            hit = self._lookup_silva(part, rank)
+            hit = _pure(self._lookup_silva(part, rank))
             if hit is not None:
                 return hit
-            hit = self._lookup_ncbi(part, genus_fallback=False)
+            hit = _pure(self._lookup_ncbi(part, genus_fallback=False))
             if hit is not None:
                 return hit
 
         if genus_fallback:
-            return self._lookup_ncbi(bare, genus_fallback=True)
+            return _pure(self._lookup_ncbi(bare, genus_fallback=True))
 
         return None
 
@@ -318,12 +338,38 @@ class SILVATranslator:
         lineage: str,
         sep: str = ";",
         genus_fallback: bool = False,
+        min_purity: float = 0.0,
+        lineage_fallback: bool = True,
     ) -> Tuple[Optional[str], Optional[list]]:
         """Translate one SILVA lineage to a current GTDB lineage.
 
         Walks the lineage from its lowest rank upward and returns the
         stored GTDB lineage of the first token that resolves, so the
         result is always a real lineage from the current release.
+
+        Parameters
+        ----------
+        lineage : str
+            A SILVA lineage.
+        sep : str
+            Separator between ranks.
+        genus_fallback : bool
+            Enable the NCBI binomial/genus fallback.
+        min_purity : float
+            Reject vote-derived mappings below this purity fraction.
+        lineage_fallback : bool
+            When ``True`` (the default), continue up the lineage if the
+            lowest rank does not resolve.  When ``False``, only the lowest
+            rank is tried and anything else fails the whole lineage.
+
+            The two reasons a rank can fail -- not present in the
+            dictionary, or present but below *min_purity* -- are treated
+            identically, so raising the threshold removes answers rather
+            than silently making them less specific.
+
+            "Lowest rank" means the deepest token that is a taxon at all:
+            structural placeholders such as ``NA`` padding are skipped
+            without counting as a failure.
 
         Returns
         -------
@@ -348,16 +394,32 @@ class SILVATranslator:
         if any(token.lower() in _ORGANELLAR for _, token in parsed):
             return None, None
 
+        # A bare epithet is meaningless alone; rejoin it to the genus that
+        # precedes it so DADA2's addSpecies output can resolve to species.
+        if len(parsed) >= 2 and parsed[-1][0] == "species" and _is_epithet(
+            parsed[-1][1]
+        ):
+            genus = parsed[-2][1]
+            parsed[-1] = ("species", f"{genus} {parsed[-1][1]}")
+
         for rank, token in reversed(parsed):
-            hit = self.lookup_token(
-                token, rank=rank, genus_fallback=genus_fallback
-            )
-            if hit is None:
+            if _is_rejected(token):
+                # Not a taxon at all; skipping it is not a failure, so it
+                # does not end the walk even without fallback.
                 continue
-            target, support = hit
-            resolved = self.ncbi.gtdb_name_to_lineage.get(target)
-            if resolved:
-                return resolved, support
+
+            hit = self.lookup_token(
+                token, rank=rank, genus_fallback=genus_fallback,
+                min_purity=min_purity,
+            )
+            if hit is not None:
+                target, support = hit
+                resolved = self.ncbi.gtdb_name_to_lineage.get(target)
+                if resolved:
+                    return resolved, support
+
+            if not lineage_fallback:
+                return None, None
         return None, None
 
     # -- batch API ---------------------------------------------------------
@@ -370,6 +432,8 @@ class SILVATranslator:
         genus_fallback: bool = False,
         multi_sep: Optional[str] = None,
         with_support: bool = False,
+        min_purity: float = 0.0,
+        lineage_fallback: bool = True,
     ):
         """Translate a batch of SILVA entries.
 
@@ -390,6 +454,11 @@ class SILVATranslator:
         with_support : bool
             Also return per-entry ``(purity, votes)`` columns, with
             purity a fraction in ``[0, 1]``.
+        min_purity : float
+            Reject vote-derived mappings below this purity fraction.
+        lineage_fallback : bool
+            Continue up the lineage when the lowest rank does not
+            resolve (default), or fail the entry instead.
 
         Returns
         -------
@@ -424,11 +493,14 @@ class SILVATranslator:
 
                 if full_lineage:
                     resolved, support = self.translate_lineage(
-                        part, sep=sep, genus_fallback=genus_fallback
+                        part, sep=sep, genus_fallback=genus_fallback,
+                        min_purity=min_purity,
+                        lineage_fallback=lineage_fallback,
                     )
                 else:
                     hit = self.lookup_token(
-                        part, genus_fallback=genus_fallback
+                        part, genus_fallback=genus_fallback,
+                        min_purity=min_purity,
                     )
                     if hit is None:
                         resolved, support = None, None

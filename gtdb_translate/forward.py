@@ -321,6 +321,7 @@ class ForwardTranslator:
         lineage: str,
         gtdb_name_to_lineage: Dict[str, str],
         sep: str = ";",
+        lineage_fallback: bool = True,
     ) -> Optional[str]:
         """Forward-translate a GTDB lineage to its current form.
 
@@ -351,6 +352,10 @@ class ForwardTranslator:
             to their full current lineage string.
         sep : str
             Separator between ranks (default ``";"``).
+        lineage_fallback : bool
+            When ``True`` (the default), work up through higher ranks if
+            the lowest one cannot be resolved.  When ``False``, only the
+            lowest rank is tried.
 
         Returns
         -------
@@ -389,6 +394,9 @@ class ForwardTranslator:
                 mapped_prefixed = f"{letter}__{mapped}"
                 if mapped_prefixed in gtdb_name_to_lineage:
                     return gtdb_name_to_lineage[mapped_prefixed]
+
+            if not lineage_fallback:
+                return None
 
         return None
 

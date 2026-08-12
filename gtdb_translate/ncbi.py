@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 from .forward import ForwardTranslator
 from .utils import (
     detect_column_format,
+    is_placeholder,
     load_bundle,
     load_legacy_gzip_json,
     save_bundle,
@@ -63,6 +64,18 @@ class NCBITranslator:
         # Carried through so SILVATranslator can share one loaded bundle.
         self.silva_name_to_gtdb: Dict[str, Dict[str, str]] = {}
         self.silva_support: Dict[str, Dict[str, list]] = {}
+
+    def _passes_purity(self, key: str, min_purity: float) -> bool:
+        """Whether the mapping stored at *key* clears *min_purity*.
+
+        Mappings with no support pass unconditionally: a GTDB taxon that
+        maps to itself has no votes behind it but is certainly correct,
+        so the threshold only ever filters vote-derived entries.
+        """
+        if min_purity <= 0:
+            return True
+        stats = self.ncbi_support.get(key)
+        return stats is None or stats[1] >= min_purity
 
     def support_for(self, name: Optional[str]) -> Optional[list]:
         """Return ``[votes, purity]`` for *name*, or ``None``.
@@ -121,6 +134,8 @@ class NCBITranslator:
         genus_fallback: bool = False,
         multi_sep: Optional[str] = None,
         with_support: bool = False,
+        min_purity: float = 0.0,
+        lineage_fallback: bool = True,
     ):
         """Translate NCBI names to GTDB.
 
@@ -153,6 +168,12 @@ class NCBITranslator:
             fails becomes a single ``"no_translation"``). If ``None``
             (default), each entry is treated as a single lineage.
 
+        min_purity : float
+            Reject vote-derived mappings whose purity falls below this
+            fraction. Mappings with no votes behind them are unaffected.
+        lineage_fallback : bool
+            Continue up the lineage when the lowest rank does not resolve
+            (default), or fail the entry instead.
         with_support : bool
             If ``True``, also return per-entry purity and vote-count
             columns.  Purity is a fraction in ``[0, 1]``.  Values are
@@ -193,7 +214,9 @@ class NCBITranslator:
                         part_vot.append("")
                         continue
                     result, stats = self._translate_single_lineage(
-                        lineage, sep=sep, genus_fallback=genus_fallback
+                        lineage, sep=sep, genus_fallback=genus_fallback,
+                        min_purity=min_purity,
+                        lineage_fallback=lineage_fallback,
                     )
                     results.append(result if result is not None else NO_TRANS)
                     pur, vot = _fmt(stats)
@@ -210,10 +233,15 @@ class NCBITranslator:
                     purities[i] = part_pur[0]
                     supports[i] = part_vot[0]
             else:
-                taxa = entry.split(sep)[::-1]
+                # sep=None means the cell holds a single value; splitting
+                # on None would fall back to whitespace and shred names.
+                taxa = (entry.split(sep) if sep else [entry])[::-1]
                 parts, part_pur, part_vot = [], [], []
                 for tax in taxa:
-                    hit = self.lookup_name(tax, genus_fallback=genus_fallback)
+                    hit = self.lookup_name(
+                        tax, genus_fallback=genus_fallback,
+                        min_purity=min_purity,
+                    )
                     if hit is not None and hit[0] != "none":
                         parts.append(hit[0][3:])
                         pur, vot = _fmt(self.support_for(hit[1]))
@@ -225,9 +253,10 @@ class NCBITranslator:
                 parts = parts[::-1]
                 if all(p == NO_TRANS for p in parts):
                     continue
-                translations[i] = sep.join(parts)
-                purities[i] = sep.join(part_pur[::-1])
-                supports[i] = sep.join(part_vot[::-1])
+                joiner = sep or ""
+                translations[i] = joiner.join(parts)
+                purities[i] = joiner.join(part_pur[::-1])
+                supports[i] = joiner.join(part_vot[::-1])
 
         if with_support:
             return translations, purities, supports
@@ -238,12 +267,19 @@ class NCBITranslator:
         lineage: str,
         sep: str,
         genus_fallback: bool,
+        min_purity: float = 0.0,
+        lineage_fallback: bool = True,
     ) -> Tuple[Optional[str], Optional[list]]:
         """Translate a single full lineage string.
 
         Tries the lowest (most specific) rank first and works up toward
         domain, returning the first GTDB match found. Returns ``None``
         if no rank in the lineage resolves to a known GTDB taxon.
+
+        When *lineage_fallback* is ``False`` only the lowest rank is
+        tried -- whether it failed because it is absent or because its
+        purity was too low -- so raising *min_purity* removes answers
+        instead of quietly returning a shallower one.
 
         The lineage does not need to start at domain -- a phylum-first
         lineage (e.g. one that's already had its domain/kingdom prefix
@@ -255,15 +291,23 @@ class NCBITranslator:
         taxa = lineage.split(sep)[::-1]
         is_domain_anchored = taxa[-1].endswith("Bacteria") or taxa[-1].endswith("Archaea")
         for ii, tax in enumerate(taxa):
-            hit = self.lookup_name(tax, genus_fallback=genus_fallback)
-            if hit is None:
+            if is_placeholder(strip_rank_prefix(tax)):
+                # Structural padding, not a failed rank.
                 continue
-            gtdb_name, matched_key = hit
-            if gtdb_name in self.gtdb_name_to_lineage:
-                best = self.gtdb_name_to_lineage[gtdb_name]
-                if is_domain_anchored and best.count(";") >= len(taxa) - ii:
-                    best = ";".join(best.split(";")[: len(taxa) - ii])
-                return best, self.support_for(matched_key)
+
+            hit = self.lookup_name(
+                tax, genus_fallback=genus_fallback, min_purity=min_purity
+            )
+            if hit is not None:
+                gtdb_name, matched_key = hit
+                if gtdb_name in self.gtdb_name_to_lineage:
+                    best = self.gtdb_name_to_lineage[gtdb_name]
+                    if is_domain_anchored and best.count(";") >= len(taxa) - ii:
+                        best = ";".join(best.split(";")[: len(taxa) - ii])
+                    return best, self.support_for(matched_key)
+
+            if not lineage_fallback:
+                return None, None
         return None, None
 
     def translate_ids(
@@ -272,6 +316,7 @@ class NCBITranslator:
         sep: str = "|",
         full_lineage: bool = False,
         with_support: bool = False,
+        min_purity: float = 0.0,
     ):
         """Translate NCBI tax IDs to GTDB names.
 
@@ -285,6 +330,8 @@ class NCBITranslator:
             If ``True``, return full GTDB lineage strings.
         with_support : bool
             If ``True``, also return purity and vote-count columns.
+        min_purity : float
+            Reject vote-derived mappings below this purity.
 
         Returns
         -------
@@ -298,7 +345,7 @@ class NCBITranslator:
             if not isinstance(taxs, str):
                 continue
             parts, part_pur, part_vot = [], [], []
-            for taxid in taxs.split(sep):
+            for taxid in (taxs.split(sep) if sep else [taxs]):
                 sci = self.ncbi_id_to_scientific.get(taxid.strip())
                 if sci is None:
                     parts.append(NO_TRANS)
@@ -306,6 +353,10 @@ class NCBITranslator:
                     part_vot.append("")
                     continue
                 gtdb_name = self.ncbi_name_to_gtdb.get(sci, "none")
+                if gtdb_name != "none" and not self._passes_purity(
+                    sci, min_purity
+                ):
+                    gtdb_name = "none"
                 if gtdb_name == "none":
                     parts.append(NO_TRANS)
                     part_pur.append("")
@@ -322,16 +373,20 @@ class NCBITranslator:
             if all(p == NO_TRANS for p in parts):
                 translations[i] = NO_TRANS
             else:
-                translations[i] = sep.join(parts)
-                purities[i] = sep.join(part_pur)
-                supports[i] = sep.join(part_vot)
+                joiner = sep or ""
+                translations[i] = joiner.join(parts)
+                purities[i] = joiner.join(part_pur)
+                supports[i] = joiner.join(part_vot)
 
         if with_support:
             return translations, purities, supports
         return translations
 
     def lookup_name(
-        self, name: str, genus_fallback: bool = False
+        self,
+        name: str,
+        genus_fallback: bool = False,
+        min_purity: float = 0.0,
     ) -> Optional[Tuple[str, str]]:
         """Look up a single NCBI name with progressive fallbacks.
 
@@ -359,8 +414,9 @@ class NCBITranslator:
         6. Genus only  (``Bombilactobacillus sp.``
            -> ``Bombilactobacillus``)
 
-        At each step, ``"none"`` values in the dictionary are treated as
-        misses so that the fallback chain continues.
+        At each step, ``"none"`` values in the dictionary -- and mappings
+        whose purity falls below *min_purity* -- are treated as misses so
+        that the fallback chain continues.
 
         Returns
         -------
@@ -372,11 +428,15 @@ class NCBITranslator:
         import re
 
         def _get(key: str) -> Optional[Tuple[str, str]]:
-            """Return (value, key) if the key exists and isn't 'none'."""
+            """Return (value, key) for a usable, sufficiently pure mapping."""
             val = self.ncbi_name_to_gtdb.get(key)
-            if val is not None and val != "none":
-                return val, key
-            return None
+            if val is None or val == "none":
+                return None
+            if not self._passes_purity(key, min_purity):
+                # Treated as a miss so the fallback chain keeps going and,
+                # in lineage mode, the walk moves up to the next rank.
+                return None
+            return val, key
 
         name = strip_rank_prefix(name.strip())
         name = re.sub(r"\s+spp?\.?$", "", name.strip())
@@ -425,10 +485,15 @@ class NCBITranslator:
         return None
 
     def _lookup_name(
-        self, name: str, genus_fallback: bool = False
+        self,
+        name: str,
+        genus_fallback: bool = False,
+        min_purity: float = 0.0,
     ) -> Optional[str]:
         """Return only the GTDB taxon from :meth:`lookup_name`."""
-        result = self.lookup_name(name, genus_fallback=genus_fallback)
+        result = self.lookup_name(
+            name, genus_fallback=genus_fallback, min_purity=min_purity
+        )
         return result[0] if result else None
 
     def to_bundle(self) -> dict:
@@ -594,6 +659,8 @@ class NCBITranslator:
         df,
         column: str,
         sample_rows: int = 100,
+        multi_sep: Optional[str] = None,
+        resolve=None,
     ) -> Dict[str, object]:
         """Infer separator / prefix / lineage conventions for *column*.
 
@@ -609,9 +676,21 @@ class NCBITranslator:
             Name of the column to inspect.
         sample_rows : int
             Number of rows to sample.
+        multi_sep : str, optional
+            Separator reserved for multiple entries per cell; excluded
+            from the rank-separator candidates.
+        resolve : callable, optional
+            Override the name resolver used for the lineage test. The
+            forward path passes one that also knows outdated names.
         """
         values = df[column].dropna().astype(str).tolist()[:sample_rows]
-        detected = detect_column_format(values, sample_size=sample_rows)
+        detected = detect_column_format(
+            values,
+            sample_size=sample_rows,
+            resolve=resolve if resolve is not None else self._lookup_name,
+            lineage_dict=self.gtdb_name_to_lineage,
+            multi_sep=multi_sep,
+        )
         logger.info("Auto-detected format for '%s': %s", column, detected)
         return detected
 

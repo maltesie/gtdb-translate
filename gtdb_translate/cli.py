@@ -16,6 +16,8 @@ import re
 import sys
 from pathlib import Path
 
+from .utils import RANK_PREFIXES
+
 
 def _build(args: argparse.Namespace) -> None:
     from .build import SILVA_COLUMNS
@@ -56,6 +58,7 @@ def _build(args: argparse.Namespace) -> None:
         metadata_paths=args.metadata,
         silva_columns=silva_columns,
         limit=args.self_test_limit,
+        min_purity=args.min_purity,
     )
     print(format_report(result))
     if not result.passed:
@@ -99,10 +102,12 @@ def _ncbi(args: argparse.Namespace) -> None:
             sys.exit(1)
         print(f"Auto-detected column: '{column_name}'")
 
-    detected = translator.detect_format(df, column_name)
+    detected = translator.detect_format(
+        df, column_name, multi_sep=args.multi_sep
+    )
     from_taxids = args.from_taxids if args.from_taxids is not None else detected["from_taxids"]
     full_lineage = args.full_lineage if args.full_lineage is not None else detected["is_full_lineage"]
-    multi_sep = args.multi_sep if args.multi_sep is not None else "|"
+    multi_sep = args.multi_sep
     lineage_sep = args.lineage_sep if args.lineage_sep is not None else (
         detected["sep"] if full_lineage else ";"
     )
@@ -111,7 +116,7 @@ def _ncbi(args: argparse.Namespace) -> None:
     if args.from_taxids is None:
         auto_notes.append(f"from_taxids={from_taxids}")
     if args.full_lineage is None:
-        auto_notes.append(f"full_lineage={full_lineage}")
+        auto_notes.append(_lineage_note(full_lineage, detected))
     if args.lineage_sep is None and full_lineage and not from_taxids:
         auto_notes.append(f"lineage_sep={lineage_sep!r}")
     if auto_notes:
@@ -124,17 +129,20 @@ def _ncbi(args: argparse.Namespace) -> None:
         # lineage regardless of the input shape.
         translations, purity, support = translator.translate_ids(
             column, sep=multi_sep, full_lineage=True, with_support=True,
+            min_purity=args.min_purity,
         )
     elif full_lineage:
         translations, purity, support = translator.translate(
             column, sep=lineage_sep, full_lineage=True,
             genus_fallback=args.genus_fallback, multi_sep=multi_sep,
-            with_support=True,
+            with_support=True, min_purity=args.min_purity,
+            lineage_fallback=args.lineage_fallback,
         )
     else:
         translations, purity, support = translator.translate(
             column, sep=multi_sep, full_lineage=False,
             genus_fallback=args.genus_fallback, with_support=True,
+            min_purity=args.min_purity,
         )
 
     # tax-ID translation already returns lineages when asked; names do not.
@@ -155,6 +163,19 @@ NO_TRANS = "no_translation"
 #: Rank prefixes tried, most specific first, when resolving a bare GTDB
 #: name back to its full lineage.
 _RANK_PREFIXES = ("s__", "g__", "f__", "o__", "c__", "p__", "d__")
+
+
+def _lineage_note(full_lineage, detected) -> str:
+    """Render the full_lineage decision with the evidence behind it.
+
+    Reporting the nesting fraction distinguishes "nothing in this column
+    nests" from "no separator was found at all" -- the former is what a
+    bundle that does not cover the input taxonomy looks like.
+    """
+    fraction = detected.get("lineage_fraction")
+    if fraction is None:
+        return f"full_lineage={full_lineage}"
+    return f"full_lineage={full_lineage} ({fraction:.0%} of cells nest)"
 
 
 def _attach_support(df, args, purity, support) -> None:
@@ -263,7 +284,9 @@ def _silva(args: argparse.Namespace) -> None:
             sys.exit(1)
         print(f"Auto-detected column: '{column_name}'")
 
-    detected = translator.detect_format(df, column_name)
+    detected = translator.detect_format(
+        df, column_name, multi_sep=args.multi_sep
+    )
     full_lineage = (
         args.full_lineage
         if args.full_lineage is not None
@@ -273,7 +296,7 @@ def _silva(args: argparse.Namespace) -> None:
 
     auto_notes = []
     if args.full_lineage is None:
-        auto_notes.append(f"full_lineage={full_lineage}")
+        auto_notes.append(_lineage_note(full_lineage, detected))
     if args.lineage_sep is None:
         auto_notes.append(f"lineage_sep={lineage_sep!r}")
     if auto_notes:
@@ -286,6 +309,8 @@ def _silva(args: argparse.Namespace) -> None:
         genus_fallback=args.genus_fallback,
         multi_sep=args.multi_sep,
         with_support=True,
+        min_purity=args.min_purity,
+        lineage_fallback=args.lineage_fallback,
     )
     _attach_outputs(
         df, args, translator, translations, full_lineage,
@@ -300,6 +325,36 @@ def _silva(args: argparse.Namespace) -> None:
 
     df.to_csv(args.out_file, index=False)
     print(f"Output written to {args.out_file}")
+
+
+def _forward_resolver(translator):
+    """Resolve a bare name the way the forward step would.
+
+    A name already in the current GTDB maps to itself; an outdated one is
+    forward-mapped first.  Using this rather than the NCBI dictionary is
+    what lets lineage detection work on a column of outdated names.
+    """
+    fwd = translator.forward
+    lineage_dict = translator.gtdb_name_to_lineage
+
+    def resolve(name):
+        for prefix in _RANK_PREFIXES:
+            if prefix + name in lineage_dict:
+                return prefix + name
+        if fwd is None:
+            return None
+        if " " in name:
+            mapped = fwd.translate(name)
+            if mapped != name and "s__" + mapped in lineage_dict:
+                return "s__" + mapped
+        for prefix in _RANK_PREFIXES[1:]:
+            rank = RANK_PREFIXES[prefix[0]]
+            mapped = fwd.translate_rank(name, rank)
+            if mapped != name and prefix + mapped in lineage_dict:
+                return prefix + mapped
+        return None
+
+    return resolve
 
 
 def _detect_forward_column(translator, df, sample_rows=100):
@@ -393,7 +448,10 @@ def _forward(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    detected = translator.detect_format(df, column_name)
+    detected = translator.detect_format(
+        df, column_name, multi_sep=args.multi_sep,
+        resolve=_forward_resolver(translator),
+    )
     full_lineage = args.full_lineage if args.full_lineage is not None else detected["is_full_lineage"]
     lineage_sep = args.lineage_sep if args.lineage_sep is not None else (
         detected["sep"] if full_lineage else ";"
@@ -401,7 +459,7 @@ def _forward(args: argparse.Namespace) -> None:
 
     auto_notes = []
     if args.full_lineage is None:
-        auto_notes.append(f"full_lineage={full_lineage}")
+        auto_notes.append(_lineage_note(full_lineage, detected))
     if args.lineage_sep is None:
         auto_notes.append(f"lineage_sep={lineage_sep!r}")
     if auto_notes:
@@ -453,7 +511,8 @@ def _forward(args: argparse.Namespace) -> None:
         """Forward-translate an entry that may contain multiple names."""
         if not isinstance(entry, str) or not entry.strip():
             return NO_TRANS
-        parts = entry.split(multi_sep)
+        # multi_sep=None means one value per cell.
+        parts = entry.split(multi_sep) if multi_sep else [entry]
         if full_lineage:
             translated = []
             for part in parts:
@@ -461,13 +520,16 @@ def _forward(args: argparse.Namespace) -> None:
                 if not part:
                     translated.append(NO_TRANS)
                     continue
-                result = fwd.translate_lineage(part, lineage_dict, sep=lineage_sep)
+                result = fwd.translate_lineage(
+                    part, lineage_dict, sep=lineage_sep,
+                    lineage_fallback=args.lineage_fallback,
+                )
                 translated.append(result if result is not None else NO_TRANS)
         else:
             translated = [forward_one(p.strip()) for p in parts]
         if all(t == NO_TRANS for t in translated):
             return NO_TRANS
-        return multi_sep.join(translated)
+        return (multi_sep or "").join(translated)
 
     forwarded = [forward_entry(v) for v in df[column_name]]
     _attach_outputs(
@@ -478,7 +540,10 @@ def _forward(args: argparse.Namespace) -> None:
     def _bare_entry(entry):
         if not isinstance(entry, str) or not entry.strip():
             return entry
-        return multi_sep.join(split_rank_prefix(p.strip())[1] for p in entry.split(multi_sep))
+        parts = entry.split(multi_sep) if multi_sep else [entry]
+        return (multi_sep or "").join(
+            split_rank_prefix(p.strip())[1] for p in parts
+        )
 
     bare_input = df[column_name].map(_bare_entry)
     n_total = len(df)
@@ -505,6 +570,17 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
     lowest-rank column is the opt-in extra.
     """
     parser.add_argument(
+        "--lineage_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When the lowest rank of a lineage does not resolve, work "
+             "up through higher ranks and return the first that does "
+             "(default: enabled). Pass --no-lineage_fallback to fail the "
+             "entry instead, so that a rejected translation disappears "
+             "rather than coming back as a shallower rank. A rank counts "
+             "as failing whether it was missing or rejected.",
+    )
+    parser.add_argument(
         "--output_lowest_rank",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -521,7 +597,16 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_report_args(parser: argparse.ArgumentParser) -> None:
-    """Add the shared purity-reporting flags to a subparser."""
+    """Add the shared purity flags to a subparser."""
+    parser.add_argument(
+        "--min_purity",
+        type=float,
+        default=0.0,
+        help="Reject a translation when the winning share of the vote "
+             "falls below this fraction (default: 0.0, i.e. no filtering; "
+             "0.5 is a reasonable starting point). Mappings with no votes "
+             "behind them are never filtered.",
+    )
     parser.add_argument(
         "--report_purity",
         action=argparse.BooleanOptionalAction,
@@ -601,6 +686,13 @@ def main(argv: list[str] | None = None) -> None:
              "built from (default: enabled)",
     )
     p_build.add_argument(
+        "--min_purity",
+        type=float,
+        default=0.0,
+        help="Purity threshold the self-test scores at; match it to the "
+             "threshold you expect users to run with (default: 0.0)",
+    )
+    p_build.add_argument(
         "--self_test_limit",
         type=int,
         default=None,
@@ -640,7 +732,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_ncbi.add_argument(
         "--multi_sep",
-        default="|",
+        default=None,
         help="Separator for multiple independent entries per cell "
              "(default: |). With --full_lineage, a cell may hold several "
              "lineages joined by --multi_sep, each internally delimited "
@@ -691,11 +783,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     p_fwd.add_argument(
         "--multi_sep",
-        default="|",
-        help="Separator for multiple independent entries per cell (default: "
-             "|). Always used, including with --full_lineage: a cell can "
-             "hold several lineages joined by --multi_sep, each internally "
-             "using --lineage_sep between ranks.",
+        default=None,
+        help="Separator for multiple independent entries per cell "
+             "(default: none -- each cell holds one value). Never "
+             "auto-detected; set it explicitly if your cells hold "
+             "several entries.",
     )
     p_fwd.add_argument(
         "--lineage_sep",
@@ -713,8 +805,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     _add_output_args(p_fwd)
     # Forward translation walks a rename graph rather than a vote tally,
-    # so there is no purity to report.
-    p_fwd.set_defaults(report_purity=False)
+    # so there is neither purity to report nor a threshold to apply.
+    p_fwd.set_defaults(report_purity=False, min_purity=0.0)
     _add_bundle_args(p_fwd)
 
     p_silva = subparsers.add_parser(

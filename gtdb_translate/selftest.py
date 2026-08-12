@@ -129,8 +129,6 @@ def _score(
         return None
 
     result.n_translated += 1
-    if purity is not None:
-        result.n_with_support += 1
     pred_bare = _split_bare(predicted)
 
     correct_here = 0
@@ -146,14 +144,34 @@ def _score(
             result.rank_correct[rank] += 1
             correct_here += 1
 
-    if purity is not None and scored_here:
-        for label, low, high in _PURITY_BUCKETS:
-            if low <= purity < high:
-                result.purity_total[label] += scored_here
-                result.purity_correct[label] += correct_here
-                break
-
     return pred_bare
+
+
+def _bucket(
+    result: PathResult,
+    predicted: Optional[str],
+    truth_bare: Sequence[str],
+    purity: Optional[float],
+) -> None:
+    """Accumulate unfiltered accuracy-by-purity, without touching coverage."""
+    if not predicted or purity is None:
+        return
+    pred_bare = _split_bare(predicted)
+    correct = scored = 0
+    for idx in range(len(SCORED_RANKS)):
+        if idx >= len(pred_bare) or idx >= len(truth_bare):
+            break
+        if not pred_bare[idx] or not truth_bare[idx]:
+            continue
+        scored += 1
+        correct += pred_bare[idx] == truth_bare[idx]
+    if not scored:
+        return
+    for label, low, high in _PURITY_BUCKETS:
+        if low <= purity < high:
+            result.purity_total[label] += scored
+            result.purity_correct[label] += correct
+            break
 
 
 def run_self_test(
@@ -161,6 +179,7 @@ def run_self_test(
     metadata_paths: Sequence[Union[str, Path]],
     silva_columns: Sequence[str] = SILVA_COLUMNS,
     limit: Optional[int] = None,
+    min_purity: float = 0.5,
 ) -> SelfTestResult:
     """Score a built bundle against the metadata it came from.
 
@@ -176,6 +195,12 @@ def run_self_test(
     limit : int, optional
         Stop after this many rows.  Useful for a quick check on a large
         release.
+    min_purity : float
+        Purity threshold to score at, matching the CLI default so the
+        headline numbers reflect what users actually get.  The purity
+        buckets are always computed unfiltered, since their whole purpose
+        is to show how accuracy varies across the range that the
+        threshold then cuts.
 
     Returns
     -------
@@ -204,29 +229,38 @@ def run_self_test(
                     silva_value = value
                     break
 
-            silva_pred = None
             silva_bare = None
             if silva_value:
-                predicted, support = silva.translate_lineage(silva_value)
-                silva_pred = predicted
-                silva_bare = _score(
+                predicted, support = silva.translate_lineage(
+                    silva_value, min_purity=min_purity
+                )
+                silva_bare = _score(result.silva, predicted, truth_bare, None)
+                # Buckets are scored unfiltered so the low-purity rows
+                # remain visible; that contrast is the diagnostic.
+                raw, raw_support = silva.translate_lineage(silva_value)
+                _bucket(
                     result.silva,
-                    predicted,
+                    raw,
                     truth_bare,
-                    support[1] if support else None,
+                    raw_support[1] if raw_support else None,
                 )
 
             ncbi_value = str(row.get(NCBI_COLUMN) or "").strip()
             ncbi_bare = None
             if ncbi_value:
                 predicted, support = translator._translate_single_lineage(
+                    ncbi_value, sep=";", genus_fallback=False,
+                    min_purity=min_purity,
+                )
+                ncbi_bare = _score(result.ncbi, predicted, truth_bare, None)
+                raw, raw_support = translator._translate_single_lineage(
                     ncbi_value, sep=";", genus_fallback=False
                 )
-                ncbi_bare = _score(
+                _bucket(
                     result.ncbi,
-                    predicted,
+                    raw,
                     truth_bare,
-                    support[1] if support else None,
+                    raw_support[1] if raw_support else None,
                 )
 
             if silva_bare and ncbi_bare:
@@ -256,8 +290,7 @@ def format_report(result: SelfTestResult) -> str:
         add(
             f"  {path.name} input / translated: "
             f"{path.n_input:,} / {path.n_translated:,} "
-            f"({path.coverage:.1%} coverage, "
-            f"{path.support_coverage:.1%} with support stats)"
+            f"({path.coverage:.1%} coverage)"
         )
 
     add("")
