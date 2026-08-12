@@ -1,7 +1,10 @@
 # gtdb-translate
 
 Translate taxonomy names from NCBI or SILVA to GTDB, and forward-translate
-renamed GTDB names across releases.
+renamed GTDB names across releases. Translation from NCBI and SILVA are
+based on majority vote of all genomes in the GTDB metadata table of the
+corresponding version. Forward translations are derived from the taxon
+history created by [gtdb-taxdump](https://github.com/shenwei356/gtdb-taxdump).
 
 Pre-built translation bundles are downloaded automatically from the
 [latest release](https://github.com/maltesie/gtdb-translate/releases)
@@ -31,16 +34,15 @@ the input had. Failed lookups get `no_translation`.
 | --- | --- | --- |
 | `<out_column_name>` | always | Full GTDB lineage, e.g. `d__Bacteria;…;s__Escherichia coli` |
 | `<out_column_name>_lowest` | `--output_lowest_rank` | Most specific translated rank, no rank prefix, e.g. `Escherichia coli` |
-| `<out_column_name>_purity` | `--report_purity` (on by default) | Winning share of the vote, `0`–`1`; `1.0` is unanimous. Empty where no votes back the mapping |
-| `<out_column_name>_support` | `--report_purity` (on by default) | Total votes behind the mapping. Empty where no votes back the mapping |
+| `<out_column_name>_purity` | `--report_purity` (on by default) | Share of the votes, `0`–`1`; `1.0` is unanimous |
+| `<out_column_name>_support` | `--report_purity` (on by default) | Total votes behind the mapping |
 
 `--report_purity` and `--min_purity` are not available for `forward`, which
 walks a rename graph rather than a vote tally.
 
 Translations whose purity falls below `--min_purity` (default `0.5`) become
 `no_translation`; in lineage mode the walk continues to the next rank up
-instead. Mappings with no votes behind them — a GTDB taxon that maps to
-itself — are never filtered.
+instead.
 
 ## Auto-detection
 
@@ -49,22 +51,17 @@ All three subcommands auto-detect the column to translate when
 sampled values are covered by the relevant dictionary. Only one column
 can be translated in one go, pass `--column_name` if you have multiple.
 
-They also auto-detect the input format of the chosen column and print what
-they inferred. A column counts as holding lineages when its taxa nest —
-each resolvable rank an ancestor of the next — in more than half its cells;
-the printed percentage is that share. This works for bare lineages and for
-every rank-prefix scheme (`d__`, `sk__`, `k__`, `D_0__`). Any inferred
-setting can be overridden explicitly:
+Any inferred setting can be overridden explicitly:
 
 | Detected | Subcommands | Overridden by |
 | --- | --- | --- |
-| Values are full lineages rather than single names | `ncbi`, `silva`, `forward` | `--full_lineage` / `--no-full_lineage` |
+| Column name to translate | `ncbi`, `silva`, `forward` | `--column_name` |
+| Values are full lineages | `ncbi`, `silva`, `forward` | `--full_lineage` |
 | Separator between ranks within a lineage | `ncbi`, `silva`, `forward` | `--lineage_sep` |
-| Values are NCBI tax IDs rather than names | `ncbi` | `--from_taxids` / `--no-from_taxids` |
+| Values are NCBI tax IDs | `ncbi` | `--from_taxids` |
 
-`--multi_sep` is never auto-detected. It defaults to none — one value per
-cell — and must be set explicitly if your cells hold several entries. When
-set, the rank separator is chosen from the remaining candidates.
+`--multi_sep` is never auto-detected and must be set explicitly if your 
+cells hold several entries separated by `--multi_sep` (see module arguments).
 
 ---
 
