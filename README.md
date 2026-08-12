@@ -46,7 +46,8 @@ itself — are never filtered.
 
 All three subcommands auto-detect the column to translate when
 `--column_name` is omitted, scoring each string column by how many of its
-sampled values are covered by the relevant dictionary.
+sampled values are covered by the relevant dictionary. Only one column
+can be translated in one go, pass `--column_name` if you have multiple.
 
 They also auto-detect the input format of the chosen column and print what
 they inferred. A column counts as holding lineages when its taxa nest —
@@ -71,16 +72,16 @@ set, the rank separator is chosen from the remaining candidates.
 
 ```bash
 gtdb-translate ncbi \
-    --in_file samples.csv \
-    --out_file samples_gtdb.csv
+    --in_file taxa.csv \
+    --out_file taxa_gtdb.csv
 ```
 
 Translate NCBI tax IDs, adding the lowest-rank column:
 
 ```bash
 gtdb-translate ncbi \
-    --in_file otus.tsv \
-    --out_file otus_gtdb.csv \
+    --in_file taxa.tsv \
+    --out_file taxa_gtdb.csv \
     --column_name tax_id \  # define column name explicitly
     --from_taxids \         # treat input as NCBI tax IDs
     --output_lowest_rank    # add column with lowest rank of translation
@@ -117,9 +118,9 @@ gtdb-translate ncbi \
 
 ```bash
 gtdb-translate silva \
-    --in_file asv_table.csv \
-    --out_file asv_gtdb.csv \
-    --column_name silva_taxonomy
+    --in_file taxa.csv \
+    --out_file taxa_gtdb.csv \
+    --column_name silva_taxonomy    # define column name explicitly
 ```
 
 Accepts bare SILVA paths (`Bacteria;Bacillota;…`) and prefixed ones as
@@ -171,10 +172,9 @@ to phylum.
 
 ```bash
 gtdb-translate forward \
-    --in_file old_data.csv \
-    --out_file updated_data.csv \
-    --column_name host_species \
-    --output_lowest_rank
+    --in_file old_gtdb.csv \
+    --out_file updated_gtdb.csv \
+    --column_name gtdb_taxa \       # define column name explicitly
 ```
 
 ### Arguments
