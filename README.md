@@ -105,7 +105,7 @@ gtdb-translate ncbi \
 --report_purity        Add the _purity and _support columns (default: enabled)
 --empty_on_fail        Write an empty string instead of 'no_translation'
 --bundle               Path to a local .msgpack.zst bundle (skips download)
---version              GTDB release to translate against (default: latest)
+--version              GTDB release to translate against (default: latest, available r232, r226.1)
 --force                Re-download the bundle even if cached locally
 ```
 
@@ -145,7 +145,7 @@ taxon names.
 --report_purity        Add the _purity and _support columns (default: enabled)
 --empty_on_fail        Write an empty string instead of 'no_translation'
 --bundle               Path to a local .msgpack.zst bundle (skips download)
---version              GTDB release to translate against (default: latest)
+--version              GTDB release to translate against (default: latest, available r232, r226.1)
 --force                Re-download the bundle even if cached locally
 ```
 
@@ -191,7 +191,7 @@ gtdb-translate forward \
 --output_lowest_rank   Add the <out_column>_lowest column (default: disabled)
 --empty_on_fail        Write an empty string instead of 'no_translation'
 --bundle               Path to a local .msgpack.zst bundle (skips download)
---version              GTDB release to translate against (default: latest)
+--version              GTDB release to translate against (default: latest, available r232, r226.1)
 --force                Re-download the bundle even if cached locally
 ```
 
