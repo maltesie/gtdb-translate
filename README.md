@@ -34,7 +34,13 @@ the input had. Failed lookups get `no_translation`.
 | `<out_column_name>_purity` | `--report_purity` (on by default) | Winning share of the vote, `0`–`1`; `1.0` is unanimous. Empty where no votes back the mapping |
 | `<out_column_name>_support` | `--report_purity` (on by default) | Total votes behind the mapping. Empty where no votes back the mapping |
 
-`--report_purity` is not available for `forward`.
+`--report_purity` and `--min_purity` are not available for `forward`, which
+walks a rename graph rather than a vote tally.
+
+Translations whose purity falls below `--min_purity` (default `0.5`) become
+`no_translation`; in lineage mode the walk continues to the next rank up
+instead. Mappings with no votes behind them — a GTDB taxon that maps to
+itself — are never filtered.
 
 ## Auto-detection
 
@@ -42,15 +48,22 @@ All three subcommands auto-detect the column to translate when
 `--column_name` is omitted, scoring each string column by how many of its
 sampled values are covered by the relevant dictionary.
 
-They also auto-detect the input format of the chosen column,
-and print what they inferred. Any inferred setting can be overridden by
-passing the corresponding flag explicitly:
+They also auto-detect the input format of the chosen column and print what
+they inferred. A column counts as holding lineages when its taxa nest —
+each resolvable rank an ancestor of the next — in more than half its cells;
+the printed percentage is that share. This works for bare lineages and for
+every rank-prefix scheme (`d__`, `sk__`, `k__`, `D_0__`). Any inferred
+setting can be overridden explicitly:
 
 | Detected | Subcommands | Overridden by |
 | --- | --- | --- |
 | Values are full lineages rather than single names | `ncbi`, `silva`, `forward` | `--full_lineage` / `--no-full_lineage` |
 | Separator between ranks within a lineage | `ncbi`, `silva`, `forward` | `--lineage_sep` |
 | Values are NCBI tax IDs rather than names | `ncbi` | `--from_taxids` / `--no-from_taxids` |
+
+`--multi_sep` is never auto-detected. It defaults to none — one value per
+cell — and must be set explicitly if your cells hold several entries. When
+set, the rank separator is chosen from the remaining candidates.
 
 ---
 
@@ -59,8 +72,7 @@ passing the corresponding flag explicitly:
 ```bash
 gtdb-translate ncbi \
     --in_file samples.csv \
-    --out_file samples_gtdb.csv \
-    --column_name species
+    --out_file samples_gtdb.csv
 ```
 
 Translate NCBI tax IDs, adding the lowest-rank column:
@@ -69,9 +81,9 @@ Translate NCBI tax IDs, adding the lowest-rank column:
 gtdb-translate ncbi \
     --in_file otus.tsv \
     --out_file otus_gtdb.csv \
-    --column_name tax_id \
-    --from_taxids \
-    --output_lowest_rank
+    --column_name tax_id \  # define column name explicitly
+    --from_taxids \         # treat input as NCBI tax IDs
+    --output_lowest_rank    # add column with lowest rank of translation
 ```
 
 ### Arguments
@@ -81,8 +93,8 @@ gtdb-translate ncbi \
 --out_file             Output CSV (required)
 --column_name          Column to translate (auto-detected if omitted)
 --out_column_name      Name for the output column (default: gtdb_translated)
---multi_sep            Separator for multiple independent entries per cell
-                       (default: |)
+--multi_sep            Separator for multiple entries per cell
+                       (default: none — one value per cell)
 --lineage_sep          Separator between ranks within a lineage
                        (default: auto-detected, usually ;)
 --full_lineage         Treat entries as full lineages (default: auto-detected)
@@ -90,6 +102,8 @@ gtdb-translate ncbi \
 --genus_fallback       Fall back to binomial/genus lookups when the exact
                        match fails (default: disabled)
 --output_lowest_rank   Add the <out_column>_lowest column (default: disabled)
+--min_purity           Reject translations below this vote purity
+                       (default: 0.5; pass 0 to disable)
 --report_purity        Add the _purity and _support columns (default: enabled)
 --empty_on_fail        Write an empty string instead of 'no_translation'
 --bundle               Path to a local .msgpack.zst bundle (skips download)
@@ -119,8 +133,8 @@ taxon names.
 --out_file             Output CSV (required)
 --column_name          Column to translate (auto-detected if omitted)
 --out_column_name      Name for the output column (default: gtdb_translated)
---multi_sep            Separator for multiple independent lineages per cell
-                       (default: none — each cell is one lineage)
+--multi_sep            Separator for multiple entries per cell
+                       (default: none — one value per cell)
 --lineage_sep          Separator between ranks within a lineage
                        (default: auto-detected, usually ;)
 --full_lineage         Treat entries as full SILVA lineages rather than single
@@ -128,6 +142,8 @@ taxon names.
 --genus_fallback       Fall back to binomial/genus lookups when the exact
                        match fails (default: disabled)
 --output_lowest_rank   Add the <out_column>_lowest column (default: disabled)
+--min_purity           Reject translations below this vote purity
+                       (default: 0.5; pass 0 to disable)
 --report_purity        Add the _purity and _support columns (default: enabled)
 --empty_on_fail        Write an empty string instead of 'no_translation'
 --bundle               Path to a local .msgpack.zst bundle (skips download)
@@ -161,8 +177,6 @@ gtdb-translate forward \
     --output_lowest_rank
 ```
 
-Requires a bundle built with `--changelog`.
-
 ### Arguments
 
 ```
@@ -171,8 +185,8 @@ Requires a bundle built with `--changelog`.
 --column_name          Column to forward-translate
                        (auto-detected if omitted)
 --out_column_name      Name for the output column (default: gtdb_forwarded)
---multi_sep            Separator for multiple independent entries per cell
-                       (default: |)
+--multi_sep            Separator for multiple entries per cell
+                       (default: none — one value per cell)
 --lineage_sep          Separator between ranks within a lineage
                        (default: auto-detected, usually ;)
 --full_lineage         Treat entries as full GTDB lineages, prefixed or bare
@@ -198,9 +212,7 @@ gtdb-translate build \
 ```
 
 Metadata files must be uncompressed. After building, the bundle is scored
-against the metadata it came from and a report is printed; the command
-exits non-zero if coverage or per-rank accuracy falls below the sanity
-thresholds.
+against the metadata it came from and a report is printed.
 
 ### Arguments
 
@@ -213,17 +225,12 @@ thresholds.
                        (default: ssu_silva_taxonomy lsu_silva_23s_taxonomy)
 --no_silva             Skip the SILVA dictionary entirely
 --self_test            Score the finished bundle (default: enabled)
+--min_purity           Purity threshold the self-test scores at (default: 0.5)
 --self_test_limit      Score only this many genomes
 --version              GTDB version label (default: r226)
 --output, -o           Output path
                        (default: gtdb_translate_<version>.msgpack.zst)
 ```
-
-## Bundle format
-
-Bundles are serialized with msgpack + zstandard. Legacy
-`translation_dicts_rXXX.json.gz` files are also readable by
-`NCBITranslator.load()`.
 
 ---
 
@@ -241,7 +248,7 @@ t.translate_ids(["562", "1280"])
 
 # purity and vote count alongside the translation
 translations, purity, support = t.translate(
-    ["Escherichia coli"], with_support=True
+    ["Escherichia coli"], with_support=True, min_purity=0.5
 )
 
 # vote statistics for a single name
